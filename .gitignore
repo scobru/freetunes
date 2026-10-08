@@ -1,0 +1,7 @@
+target
+node_modules
+dist
+.devnode
+.secrets
+.env.local
+ui/public/test.mp3
