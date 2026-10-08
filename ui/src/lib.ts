@@ -3,7 +3,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import {
   FreenetWsApi, ContractKey, ContractContainer, ContractType, WasmContractV1, PutRequest, GetRequest,
-  UpdateRequest, UpdateData, UpdateDataType, DeltaUpdate,
+  UpdateRequest, UpdateData, UpdateDataType, DeltaUpdate, SubscribeRequest,
   DelegateRequest, type DelegateResponse, type ResponseHandler,
 } from "@freenetorg/freenet-stdlib";
 import { ApplicationMessageT, ContractCodeT } from "@freenetorg/freenet-stdlib/common";
@@ -34,8 +34,12 @@ export interface TrackMeta { title: string; chunks: ChunkRef[] }
 export interface ReleaseMeta {
   title: string; artist: string; license: string; rights: boolean;
   cover?: { addr: string; n: number }; tracks: TrackMeta[]; ts: number;
+  /** The artist took the release down (a tombstone: no title, no tracks). */
+  deleted?: boolean;
 }
-export interface DirEntry { params: string; title: string; artist: string; ts: number; nonce: number; sig: string }
+export interface DirEntry {
+  params: string; title: string; artist: string; cover?: string; removed?: boolean; ts: number; nonce: number; sig: string;
+}
 export interface DirState { entries: Record<string, DirEntry>; blocked: { ts: number; list: string[]; sig: string } }
 
 // The directory address depends on this admin key (its parameter): changing it creates a new, empty directory.
@@ -46,6 +50,11 @@ const POW_BITS = 18; // must match directory/src/lib.rs (sha256, a few seconds o
 interface Waiter { resolve(r: DelegateResponse): void; reject(e: Error): void }
 const delegateWaiters: Waiter[] = [];
 
+type Listener = () => void;
+const listeners = new Set<Listener>();
+/** Called when a contract we subscribed to changes. Returns an unsubscribe function. */
+export const onRemoteChange = (l: Listener) => { listeners.add(l); return () => listeners.delete(l); };
+
 let apiP: Promise<FreenetWsApi> | undefined;
 export function api(): Promise<FreenetWsApi> {
   return (apiP ??= new Promise((resolve, reject) => {
@@ -53,7 +62,7 @@ export function api(): Promise<FreenetWsApi> {
       ? `ws://${import.meta.env.VITE_NODE ?? "127.0.0.1:7509"}/v1/contract/command`
       : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/v1/contract/command`); // the shell only proxies its own origin
     const h: ResponseHandler = {
-      onContractPut() {}, onContractGet() {}, onContractUpdate() {}, onContractUpdateNotification() {},
+      onContractPut() {}, onContractGet() {}, onContractUpdate() {}, onContractUpdateNotification: () => listeners.forEach((l) => l()),
       onContractNotFound: () => console.warn("contract not found"),
       onDelegateResponse: (r) => delegateWaiters.shift()?.resolve(r),
       onErr: (e) => console.error(e.cause),
@@ -291,7 +300,32 @@ export async function publishRelease(meta: Omit<ReleaseMeta, "ts">) {
 
 export async function loadRelease(instance: string, params: string): Promise<Release> {
   const s = await getJson<{ meta_json: string; sig: string }>(instance);
-  return { instance, params, meta: JSON.parse(s.meta_json) as ReleaseMeta };
+  const blank: ReleaseMeta = { title: "", artist: "", license: "own", rights: false, tracks: [], ts: 0 };
+  return { instance, params, meta: { ...blank, ...JSON.parse(s.meta_json) } as ReleaseMeta };
+}
+
+/** Sign a new state and send it to the release contract. A newer timestamp wins, so it must beat the current one. */
+async function pushState(instance: string, params: string, meta: object, current: number) {
+  const me = await identity(); // must be the release owner
+  const meta_json = JSON.stringify({ ...meta, ts: Math.max(Date.now(), current + 1) });
+  const sig = await me.sign(`ftr1|${params}|${meta_json}`);
+  await retrying(() => sendDelta(instance, { meta_json, sig }));
+}
+
+/** Owner only: replace the release with an edited version. `current` is the timestamp of the version being edited. */
+export const updateRelease = (instance: string, params: string, meta: Omit<ReleaseMeta, "ts">, current: number) =>
+  pushState(instance, params, meta, current);
+
+/**
+ * Owner only: take the release down. The state becomes a tombstone without any reference to the audio. The chunks
+ * themselves stay on Freenet for as long as nodes host them, and anyone who already has their addresses can fetch them.
+ */
+export const deleteRelease = (instance: string, params: string, current: number) =>
+  pushState(instance, params, { deleted: true }, current);
+
+/** Follow a release: `onRemoteChange` listeners run when its owner edits or removes it. */
+export async function watchRelease(instance: string) {
+  await (await api()).subscribe(new SubscribeRequest(fullKey(instance)));
 }
 
 // ---------------------------------------------------------------- directory
@@ -315,17 +349,17 @@ const zeroBits = (h: Uint8Array) => {
   return n;
 };
 
-/** List a release you own: sign the entry and mine the proof-of-work (a few seconds). */
-export async function listRelease(instance: string, params: string, title: string, artist: string) {
+/** List a release you own, or (with `removed`) take its entry down: sign it and mine the proof-of-work (a few seconds). */
+export async function listRelease(instance: string, params: string, title: string, artist: string, cover = "", removed = false) {
   const me = await identity(); // must be the release owner (first 32 bytes of params)
-  const ts = Date.now(), msg = `ftl1|${instance}|${params}|${title}|${artist}|${ts}`;
+  const ts = Date.now(), msg = `ftl1|${instance}|${params}|${title}|${artist}|${cover}|${ts}|${removed ? 1 : 0}`;
   const sig = await me.sign(msg);
   let nonce = 0;
   while (zeroBits(sha256(enc.encode(`${msg}|${nonce}`))) < POW_BITS) {
     if (++nonce % 20000 === 0) await new Promise((r) => setTimeout(r)); // let the page breathe while mining
   }
   await loadDirectory(); // makes sure it exists and caches its full key for the update
-  await sendDelta(await directoryId(), { entries: { [instance]: { params, title, artist, ts, nonce, sig } } });
+  await sendDelta(await directoryId(), { entries: { [instance]: { params, title, artist, cover, removed, ts, nonce, sig } } });
 }
 
 /** Admin only: replace the blocklist (blocked releases disappear from the directory). */

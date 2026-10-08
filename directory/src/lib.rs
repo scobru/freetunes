@@ -18,9 +18,15 @@ pub struct Entry {
     pub params: String, // release parameters, hex: owner pubkey (32 bytes) || salt
     pub title: String,
     pub artist: String,
+    /// Address of the cover chunk, empty if the release has none.
+    #[serde(default)]
+    pub cover: String,
+    /// The owner took the release down. The entry stays as a tombstone so an older one cannot come back.
+    #[serde(default)]
+    pub removed: bool,
     pub ts: u64,
     pub nonce: u64,
-    pub sig: String, // hex, by the release owner over `ftl1|<instance>|<params>|<title>|<artist>|<ts>`
+    pub sig: String, // hex, by the release owner over `ftl1|<instance>|<params>|<title>|<artist>|<cover>|<ts>|<removed 0/1>`
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -89,12 +95,15 @@ fn check_entry(instance: &str, e: &Entry) -> R<()> {
     if t == 0 || t > MAX_TITLE || e.title.chars().any(char::is_control) {
         return Err("bad title".into());
     }
+    if !e.cover.is_empty() && !is_id(&e.cover) {
+        return Err("bad cover".into());
+    }
     let a = e.artist.chars().count();
     if a == 0 || a > MAX_ARTIST || e.artist.chars().any(char::is_control) {
         return Err("bad artist".into());
     }
     let owner = e.params.get(..64).ok_or("params too short")?;
-    let msg = format!("ftl1|{instance}|{}|{}|{}|{}", e.params, e.title, e.artist, e.ts);
+    let msg = format!("ftl1|{instance}|{}|{}|{}|{}|{}|{}", e.params, e.title, e.artist, e.cover, e.ts, u8::from(e.removed));
     verify(&key(owner)?, msg.as_bytes(), &e.sig)?;
     let h = Sha256::digest(format!("{msg}|{}", e.nonce).as_bytes());
     if zero_bits(&h) < POW_BITS {
@@ -256,13 +265,17 @@ mod tests {
 
     /// Valid entry for `instance`, mining a real nonce (about 2^18 hashes).
     fn entry(instance: &str, owner: &SigningKey, title: &str, ts: u64) -> Entry {
+        entry_r(instance, owner, title, ts, false)
+    }
+
+    fn entry_r(instance: &str, owner: &SigningKey, title: &str, ts: u64, removed: bool) -> Entry {
         let o = format!("{}{}", pk(owner), "cd".repeat(16));
-        let msg = format!("ftl1|{instance}|{o}|{title}|Band|{ts}");
+        let msg = format!("ftl1|{instance}|{o}|{title}|Band||{ts}|{}", u8::from(removed));
         let sig = hex::encode(owner.sign(msg.as_bytes()).to_bytes());
         let nonce = (0u64..)
             .find(|n| zero_bits(&Sha256::digest(format!("{msg}|{n}").as_bytes())) >= POW_BITS)
             .unwrap();
-        Entry { params: o, title: title.into(), artist: "Band".into(), ts, nonce, sig }
+        Entry { params: o, title: title.into(), artist: "Band".into(), cover: String::new(), removed, ts, nonce, sig }
     }
 
     fn block(admin: &SigningKey, ts: u64, list: &[&str]) -> Blocklist {
@@ -319,8 +332,36 @@ mod tests {
     }
 
     #[test]
+    fn owner_removal_is_a_tombstone() {
+        let a = pk(&sk(1));
+        let owner = sk(2);
+        let mut s = RegState::default();
+        let live = entry("RelA", &owner, "First EP", 10);
+        apply(&a, &mut s, Delta { entries: [("RelA".into(), live.clone())].into(), blocked: None }).unwrap();
+        // the owner removes it: a newer, signed tombstone replaces the entry
+        let gone = entry_r("RelA", &owner, "First EP", 20, true);
+        apply(&a, &mut s, Delta { entries: [("RelA".into(), gone)].into(), blocked: None }).unwrap();
+        assert!(s.entries["RelA"].removed);
+        // the old live entry cannot come back, even replayed later
+        apply(&a, &mut s, Delta { entries: [("RelA".into(), live)].into(), blocked: None }).unwrap();
+        assert!(s.entries["RelA"].removed && s.entries["RelA"].ts == 20);
+        // the removed flag is covered by the signature: flipping it invalidates the entry
+        let mut forged = entry("RelB", &owner, "Other", 5);
+        forged.removed = true;
+        assert!(check_entry("RelB", &forged).is_err());
+        // the cover address is signed too, and must look like an address
+        let mut swapped = entry("RelC", &owner, "Third", 5);
+        swapped.cover = "SomeOtherCover".into();
+        assert!(check_entry("RelC", &swapped).is_err());
+        let mut junk = entry("RelD", &owner, "Fourth", 5);
+        junk.cover = "not an address!".into();
+        assert!(check_entry("RelD", &junk).is_err());
+        validate(&a, &s).unwrap();
+    }
+
+    #[test]
     fn prune_keeps_newest() {
-        let fake = |ts| Entry { params: String::new(), title: String::new(), artist: String::new(), ts, nonce: 0, sig: String::new() };
+        let fake = |ts| Entry { params: String::new(), title: String::new(), artist: String::new(), cover: String::new(), removed: false, ts, nonce: 0, sig: String::new() };
         let mut m: BTreeMap<String, Entry> = (1..=5u64).map(|i| (format!("p{i}"), fake(i))).collect();
         prune(&mut m, 3);
         assert_eq!(m.keys().cloned().collect::<Vec<_>>(), ["p3", "p4", "p5"]);

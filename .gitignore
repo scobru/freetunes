@@ -5,3 +5,4 @@ dist
 .secrets
 .env.local
 ui/test-assets/
+ui/public/test*.mp3

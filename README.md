@@ -9,6 +9,8 @@
 An artist publishes a release (cover, title, licence, MP3 tracks) and anyone can stream it. No accounts, no hosting, no payments.
 
 - **Publish**: pick the MP3 files and an optional cover, choose a licence, tick the rights declaration, publish. Optionally list the release in the public directory.
+- **Edit**: the artist can change title, artist, licence and cover, rename, reorder and remove tracks, and add new ones. The release keeps its address; listeners are told when it changes.
+- **Remove**: the artist can take a release down. It disappears from FreeTunes and from the directory, and the contract is replaced by a signed notice. **This does not erase the audio** (see below).
 - **Stream**: a release page with the cover, track list and a player. Playback starts after the first chunk arrives instead of waiting for the whole file, and you can seek once the track is buffered.
 - **Explore**: the public directory, newest first.
 
@@ -19,11 +21,11 @@ Everything is a Freenet contract:
 | Contract | What it holds | Address |
 | --- | --- | --- |
 | **Chunk** (`chunk/`) | A slice of a file (audio or cover). Immutable. | `blake3(code \|\| blake3(content))`: a chunk can be checked against its address |
-| **Release** (`release/`) | Title, artist, licence, rights declaration, cover and, per track, the ordered chunk addresses with sizes and durations. Signed by the artist, immutable. | `blake3(code \|\| owner key \|\| random salt)` |
-| **Directory** (`directory/`) | Public list of releases. Each entry is signed by the release owner and carries a proof-of-work. The newest 500 are kept. The admin key can publish a signed blocklist. | one shared instance (its parameter is the admin public key) |
+| **Release** (`release/`) | Title, artist, licence, rights declaration, cover and, per track, the ordered chunk addresses with sizes and durations. Signed by the artist. The artist can replace it with a newer signed state (last write wins by timestamp) or with a signed tombstone that drops every reference to the audio. | `blake3(code \|\| owner key \|\| random salt)` |
+| **Directory** (`directory/`) | Public list of releases. Each entry (title, artist, cover address) is signed by the release owner and carries a proof-of-work. The owner can replace it or mark it removed; the tombstone stays so an older entry cannot come back. The newest 500 are kept. The admin key can publish a signed blocklist. | one shared instance (its parameter is the admin public key) |
 | **Identity delegate** (`delegate/`) | The artist's signing key, plus a small per-app store (artist name, your releases, published chunk addresses). | one per calling web app |
 
-The release contract refuses anything that does not carry `rights: true`, a known licence and valid, signed metadata. Signatures are bound to the full contract parameters, so a signed release cannot be cloned into another contract.
+The release contract refuses anything that does not carry `rights: true`, a known licence and valid, signed metadata, edits included. Only the key the release was created with can edit or remove it. Signatures are bound to the full contract parameters, so a signed release cannot be cloned into another contract.
 
 ### Streaming
 
@@ -57,7 +59,9 @@ On a local dev node (no network latency):
 - **MP3 only** (MPEG-1 Layer III). No transcoding. Other formats are rejected at publish time.
 - Streaming through `MediaSource` was checked in Chromium (buffering, duration, seeking). Audible playback was not checked in the test environment, and `audio/mpeg` support in other browsers is untested.
 - Limits in the UI: 30 tracks and 250 MB per release, 60 MB per track.
-- No payments, downloads page, comments, artist profile pages or editing of a published release.
+- No payments, downloads page, comments or artist profile pages.
+- **Removing a release does not erase its audio.** Chunks are content-addressed and immutable: they stay on the network while nodes host them, and anyone who already has their addresses can fetch them. Removal only deletes the references (the track list) from the release and the directory.
+- Editing and removing work from the node that published the release: the identity belongs to that node.
 - The blocklist only hides a release from the directory. It cannot remove it from Freenet.
 
 ## Development
@@ -73,7 +77,8 @@ for n in chunk release directory identity; do cp target/wasm32-unknown-unknown/r
 mkdir -p .devnode/config .devnode/data .devnode/log
 freenet local local --ws-api-port 7510 --config-dir .devnode/config --data-dir .devnode/data --log-dir .devnode/log --disable-auto-update
 
-# a test track, then the UI
+# a test track (kept out of ui/public, which is published with the site), then the UI
+mkdir -p ui/test-assets
 ffmpeg -f lavfi -i "sine=frequency=440:duration=300" -c:a libmp3lame -b:a 128k ui/test-assets/test.mp3
 cd ui && npm install && echo VITE_NODE=127.0.0.1:7510 > .env.local && npm run dev
 ```
