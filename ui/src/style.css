@@ -1,0 +1,29 @@
+:root { color-scheme: light dark; --bg: #f6f5f9; --fg: #1d1b24; --card: #fff; --accent: #e0457b; --line: #d9d6e4; }
+@media (prefers-color-scheme: dark) { :root { --bg: #16151b; --fg: #ecebf3; --card: #211f2a; --line: #3a3750; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+main { max-width: 640px; margin: 0 auto; padding: 24px 16px 40px; }
+h1 small { display: block; font-size: .5em; font-weight: 400; opacity: .6; }
+input, select, textarea, button { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; box-sizing: border-box; }
+input:not([type=radio]):not([type=checkbox]):not([type=file]), textarea, select { width: 100%; margin: 4px 0; }
+main > label { display: block; margin: 8px 0; }
+input[type=checkbox] { margin-right: 8px; }
+button { cursor: pointer; }
+button.primary, a.btn.primary { background: var(--accent); border: 1px solid var(--accent); color: #fff; }
+a.btn { display: inline-block; padding: 8px 14px; border-radius: 8px; text-decoration: none; }
+a { color: var(--accent); }
+.muted { opacity: .7; } .err { color: #d33; }
+.banner { background: var(--accent); color: #fff; text-align: center; padding: 6px 12px; font-size: .85em; }
+.notice { border: 1px solid var(--line); border-left: 4px solid var(--accent); background: var(--card); border-radius: 8px; padding: 8px 12px; font-size: .9em; }
+.head { display: flex; gap: 16px; align-items: flex-start; }
+.head img { width: 160px; height: 160px; object-fit: cover; border-radius: 12px; flex: none; }
+audio { width: 100%; margin: 8px 0 0; }
+ol.tracks { list-style: none; padding: 0; margin: 12px 0; }
+ol.tracks li { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 8px; }
+ol.tracks li.on { background: var(--card); outline: 1px solid var(--accent); }
+ol.tracks li span { flex: 1; }
+ol#tracklist { padding-left: 20px; }
+ol#tracklist li { margin: 4px 0; }
+ol#tracklist li input { width: 60%; }
+progress { width: 100%; }
+footer { max-width: 640px; margin: 0 auto; padding: 0 16px 32px; font-size: .85em; opacity: .7; }
+@media (max-width: 480px) { .head { flex-direction: column; } .head img { width: 100%; height: auto; max-height: 320px; } }
