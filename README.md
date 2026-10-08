@@ -74,7 +74,7 @@ mkdir -p .devnode/config .devnode/data .devnode/log
 freenet local local --ws-api-port 7510 --config-dir .devnode/config --data-dir .devnode/data --log-dir .devnode/log --disable-auto-update
 
 # a test track, then the UI
-ffmpeg -f lavfi -i "sine=frequency=440:duration=300" -c:a libmp3lame -b:a 128k ui/public/test.mp3
+ffmpeg -f lavfi -i "sine=frequency=440:duration=300" -c:a libmp3lame -b:a 128k ui/test-assets/test.mp3
 cd ui && npm install && echo VITE_NODE=127.0.0.1:7510 > .env.local && npm run dev
 ```
 

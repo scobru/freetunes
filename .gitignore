@@ -4,4 +4,4 @@ dist
 .devnode
 .secrets
 .env.local
-ui/public/test*.mp3
+ui/test-assets/
