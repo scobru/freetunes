@@ -157,4 +157,11 @@ ol.tracks li { flex-wrap: wrap; }
 .chead small { margin-left: 6px; }
 button.link { background: none; border: 0; padding: 0; color: var(--muted); font-size: .8rem; font-weight: 500; text-decoration: underline; }
 button.link:hover:not(:disabled) { color: var(--danger); }
-@media (max-width: 640px) { .cpanel { padding-left: 0; } }
+.rbtn { margin-left: 8px; }
+.rpanel { flex-basis: 100%; padding: 6px 0 4px 50px; }
+#rel-rpanel { padding-left: 0; }
+.radios label { display: flex; align-items: flex-start; margin: 4px 0; }
+.ok { color: var(--accent); }
+.rep { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.rep p { margin: 4px 0; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .cpanel, .rpanel { padding-left: 0; } }

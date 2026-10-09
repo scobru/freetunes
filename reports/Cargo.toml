@@ -1,0 +1,24 @@
+[package]
+name = "freetunes-reports"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.8", features = ["contract"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+blake3 = "1"
+# ante: proof-of-work commitments signed by the node-held ante delegate (no protocol feature: contracts need only the proof)
+ante-core = { git = "https://github.com/soudasuwa/ante", rev = "80c0673cbfb58a3bde413274787959a0b502901b", default-features = false }
+
+[dev-dependencies]
+ed25519-dalek = "2"
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []

@@ -3,7 +3,7 @@ import {
   backupIsEncrypted, blockReleases, clearLink, createIdentity, currentLink, deleteRelease, finishLink, flushKnown, fmtTime, getChunk,
   isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeBackup, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
   postComment, putChunk, readBackup, removeComment, replaceIdentity, restoreBackup, splitMp3, startLink, storeGet, storePut, Streamer, updateRelease,
-  verifyLink, watchRelease, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
+  verifyLink, watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -23,6 +23,7 @@ const RIGHTS_TEXT =
 
 const ICON_PLAY = `<svg class="play-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5v13l11-6.5z"/></svg>`;
 const ICON_CHAT = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2.5h12v8H8.5L5 13.5v-3H2z"/></svg>`;
+const ICON_FLAG = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h1.5V15H3zM5 2h8l-2 3 2 3H5z"/></svg>`;
 const ICON_PAUSE = `<svg class="pause-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h3.5v13H3zM9.5 1.5H13v13H9.5z"/></svg>`;
 
 // route: #/ explore | #/publish | #/identity | #/r/<id>.<params> | #/edit/<id>.<params> | #/admin (not linked anywhere)
@@ -309,9 +310,13 @@ async function releasePage(instance: string, params: string) {
         <span class="tt">${esc(t.title)}</span><span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>
         <small class="muted">${fmtTime(t.chunks.reduce((s, c) => s + c.ms, 0))}</small>
         <button type="button" class="cbtn" data-c="${i}" aria-expanded="false" aria-label="Comments on ${esc(t.title)}">${ICON_CHAT}<span class="cn"></span></button>
-        <div class="cpanel" hidden></div></li>`).join("")}</ol>
+        <button type="button" class="cbtn rbtn" data-r="${i}" aria-expanded="false" aria-label="Report ${esc(t.title)}" title="Report this track">${ICON_FLAG}<span class="rn"></span></button>
+        <div class="cpanel" hidden></div><div class="rpanel" hidden></div></li>`).join("")}</ol>
+    <div id="reports" class="notice" hidden></div>
     <label class="field share"><span>Link to share</span><input readonly value="${esc(pageUrl(hash))}" onfocus="this.select()" /></label>
-    <p class="notice">The artist declared having the right to publish this music. FreeTunes is an experiment and cannot verify that claim or erase a release.</p>
+    <p class="notice">The artist declared having the right to publish this music. FreeTunes is an experiment and cannot verify that claim or erase a release.
+      Think it is not theirs to publish? <a href="#" id="report-release">Report this release</a>.</p>
+    <div class="rpanel" id="rel-rpanel" hidden></div>
     <div id="confirm"></div>`;
   lazyCovers(app);
 
@@ -403,6 +408,61 @@ async function releasePage(instance: string, params: string) {
     void loadComments(m.comments).then((st) => { cs = st; drawCounts(); opened.forEach(drawList); }).catch(() => {});
     void watchRelease(m.comments).catch(() => {});
   }
+
+  // ---- reports: anyone can report (ante proof of work against spam); a report is public information, it hides nothing ----
+  let rs: ReportsState = { reports: {} };
+  const drawReports = () => {
+    const all = reportsFor(rs, instance), box = $("#reports");
+    rows.forEach((li, t) => { const n = all.filter((r) => r.track === t).length; $(".rn", li).textContent = String(n || ""); });
+    const copyright = all.filter((r) => r.kind === "copyright").length;
+    box.hidden = !all.length;
+    box.innerHTML = all.length
+      ? `<b>${all.length} report${all.length === 1 ? "" : "s"}</b> about this release${copyright ? ` (${copyright} about copyright)` : ""}. Reports are claims, not verdicts: nothing is hidden automatically.`
+      : "";
+  };
+  const reloadReports = async () => { rs = await loadReports(); drawReports(); };
+  const reportPanels = rows.map((li) => $<HTMLElement>(".rpanel", li));
+  function buildReport(panel: HTMLElement, track: number, what: string) {
+    panel.innerHTML = `
+      <p><b>Report ${esc(what)}</b></p>
+      <div class="radios">
+        <label><input type="radio" name="k${track}" value="copyright" checked /> It may infringe copyright</label>
+        <label><input type="radio" name="k${track}" value="illegal" /> It is illegal content</label>
+        <label><input type="radio" name="k${track}" value="other" /> Something else</label>
+      </div>
+      <textarea class="rnote" rows="3" maxlength="300" placeholder="What is wrong? For copyright: who owns the rights, where to check."></textarea>
+      <label class="field"><span>Contact (optional, public)</span><input class="rcontact" maxlength="100" /></label>
+      <p class="muted"><small>To keep spam out, your Freenet node asks you to allow a few seconds of proof of work (<a href="https://github.com/soudasuwa/ante" target="_blank" rel="noopener noreferrer">ante</a>). The report is public and permanent.</small></p>
+      <div class="actions"><button type="button" class="primary rsend">Send report</button><span class="rmsg muted"></span></div>`;
+    const btn = $<HTMLButtonElement>(".rsend", panel), msg = $(".rmsg", panel);
+    btn.onclick = async () => {
+      const kind = (panel.querySelector<HTMLInputElement>("input[type=radio]:checked")?.value ?? "copyright") as Kind;
+      const note = $<HTMLTextAreaElement>(".rnote", panel).value, contact = $<HTMLInputElement>(".rcontact", panel).value;
+      if (kind === "other" && !note.trim()) return void (msg.textContent = "Say what is wrong.");
+      btn.disabled = true;
+      try {
+        await sendReport({ target: instance, track, kind, note, contact }, (t) => (msg.textContent = t));
+        panel.innerHTML = `<p class="ok">Thank you. Your report was sent.</p>`;
+        await reloadReports();
+      } catch (e) {
+        msg.textContent = e instanceof ReportDeclined ? "Cancelled: nothing was sent." : `Error: ${(e as Error).message ?? e}`;
+        btn.disabled = false;
+      }
+    };
+  }
+  rows.forEach((li, t) => ($<HTMLButtonElement>(".rbtn", li).onclick = (e) => {
+    const open = reportPanels[t].hidden;
+    reportPanels[t].hidden = !open;
+    (e.currentTarget as HTMLElement).setAttribute("aria-expanded", String(open));
+    if (open) buildReport(reportPanels[t], t, `“${m.tracks[t].title}”`);
+  }));
+  $("#report-release").onclick = (e) => {
+    e.preventDefault();
+    const panel = $("#rel-rpanel");
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden) buildReport(panel, WHOLE_RELEASE, `the release “${m.title}”`);
+  };
+  void reloadReports().catch(() => {}); // after the rest is loaded: the first visitor on a node creates the contract
 
   // any subscribed contract can notify us: look at what changed
   const off = onRemoteChange(async () => {
@@ -652,6 +712,23 @@ async function admin() {
     </div>`;
   try { $<HTMLTextAreaElement>("#bl").value = (await loadDirectory()).blocked.list.join("\n"); }
   catch (e) { $("#msg").textContent = `Could not load the directory: ${e}`; }
+  app.insertAdjacentHTML("beforeend", `<h2>Reports</h2><div id="reps" class="card"><p class="muted">Loading...</p></div>`);
+  try {
+    const all = Object.values((await loadReports()).reports).sort((a, b) => b.ts - a.ts), box = $("#reps");
+    const byRelease = new Map<string, typeof all>();
+    for (const r of all) byRelease.set(r.target, [...(byRelease.get(r.target) ?? []), r]);
+    box.innerHTML = all.length ? [...byRelease].sort(([, a], [, b]) => b.length - a.length).map(([target, rs]) => `
+      <div class="rep"><b>${rs.length} report${rs.length === 1 ? "" : "s"}</b> · <code>${esc(target)}</code>
+        <button type="button" class="link" data-block="${esc(target)}">Add to blocklist</button>
+        ${rs.map((r) => `<p><span class="chip">${esc(r.kind)}</span> ${r.track === WHOLE_RELEASE ? "release" : `track ${r.track + 1}`} · ${esc(r.note || "(no note)")}
+          <small class="muted">${r.contact ? `contact: ${esc(r.contact)} · ` : ""}ante ${esc(r.a.slice(0, 8))}… · ${new Date(r.ts).toLocaleString()}</small></p>`).join("")}</div>`).join("")
+      : `<p class="muted">No reports.</p>`;
+    box.querySelectorAll<HTMLButtonElement>("[data-block]").forEach((b) => (b.onclick = () => {
+      const t = $<HTMLTextAreaElement>("#bl"), id = b.dataset.block!;
+      if (!t.value.split("\n").includes(id)) t.value = (t.value.trim() ? t.value.trim() + "\n" : "") + id;
+      b.textContent = "Added: now publish the blocklist";
+    }));
+  } catch (e) { $("#reps").innerHTML = `<p class="err">Could not load the reports: ${esc(String(e))}</p>`; }
   $("#go").onclick = async () => {
     const list = $<HTMLTextAreaElement>("#bl").value.split("\n").map((l) => l.trim()).filter(Boolean);
     $("#msg").textContent = "Sending...";

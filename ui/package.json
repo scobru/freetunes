@@ -2,7 +2,7 @@
   "name": "freetunes-ui",
   "private": true,
   "type": "module",
-  "scripts": { "dev": "vite", "build": "tsc --noEmit && vite build", "test": "node --test src/whoiam.test.ts" },
+  "scripts": { "dev": "vite", "build": "tsc --noEmit && vite build", "test": "node --test src/whoiam.test.ts src/ante.test.ts" },
   "dependencies": {
     "@freenetorg/freenet-stdlib": "^0.4.0",
     "@noble/ed25519": "^2.2.3",

@@ -13,12 +13,17 @@ import {
   RelatedContractsT, WasmDelegateV1T,
 } from "@freenetorg/freenet-stdlib/client-request";
 import { personaName, verifyProof } from "./whoiam";
+import { ANTE_CODE_HASH, REPORT_BITS, WHOLE_RELEASE, challengeBytes, checkProof, clean, grind, reportPurpose, type Kind, type ReportBody } from "./ante";
+import { asBytes, cborDecode, cborEncode, enumVariant, mapGet, type CborValue } from "./cbor";
+export { WHOLE_RELEASE, KINDS, type Kind } from "./ante";
 export { personaName };
 import chunkWasm from "./chunk.wasm?url";
 import releaseWasm from "./release.wasm?url";
 import directoryWasm from "./directory.wasm?url";
 import commentsWasm from "./comments.wasm?url";
 import identityWasm from "./identity.wasm?url";
+import reportsWasm from "./reports.wasm?url";
+import anteWasm from "./ante-delegate.wasm?url";
 
 const { bytesToHex: hex, hexToBytes: unhex } = ed.etc;
 const enc = new TextEncoder();
@@ -165,7 +170,7 @@ let delegateKey: DelegateKeyT | undefined;
 let delegateChain: Promise<unknown> = Promise.resolve();
 
 // Every delegate request, registration included, gets one DelegateResponse with no request id: go one at a time.
-function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
+function sendDelegate(req: DelegateRequest, timeoutMs = 8000): Promise<DelegateResponse> {
   const run = async () => {
     let waiter!: Waiter;
     const reply = new Promise<DelegateResponse>((resolve, reject) => {
@@ -174,7 +179,7 @@ function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
       setTimeout(() => {
         const i = delegateWaiters.indexOf(waiter);
         if (i >= 0) { delegateWaiters.splice(i, 1); reject(new Error("delegate timeout")); }
-      }, 8000);
+      }, timeoutMs);
     });
     const a = (await api()) as unknown as { sendRequest(r: ClientRequestT): void }; // the SDK has no delegate method yet
     a.sendRequest(new ClientRequestT(ClientRequestType.DelegateRequest, req));
@@ -185,26 +190,38 @@ function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
   return p;
 }
 
-async function registerDelegate() {
-  const code = new Uint8Array(await (await fetch(identityWasm)).arrayBuffer());
+/** Hand a delegate's wasm to the node (idempotent) and return its key: blake3(blake3(wasm)) for empty parameters. */
+async function registerWasmDelegate(wasmUrl: string, expectHash?: string): Promise<DelegateKeyT> {
+  const code = new Uint8Array(await (await fetch(wasmUrl)).arrayBuffer());
   const codeHash = blake3(code);
-  delegateKey = new DelegateKeyT(Array.from(blake3(codeHash)), Array.from(codeHash)); // empty params: blake3(codeHash)
-  const wasm = new WasmDelegateV1T([], new DelegateCodeT(Array.from(code), Array.from(codeHash)), delegateKey);
+  if (expectHash && hex(codeHash) !== expectHash) throw new Error("unexpected delegate code");
+  const key = new DelegateKeyT(Array.from(blake3(codeHash)), Array.from(codeHash));
+  const wasm = new WasmDelegateV1T([], new DelegateCodeT(Array.from(code), Array.from(codeHash)), key);
   const container = new DelegateContainerT(DelegateType.WasmDelegateV1, wasm);
   // the node ignores cipher and nonce (secrets use a node-side key) but still checks their sizes
   await sendDelegate(new DelegateRequest(DelegateRequestType.RegisterDelegate, new RegisterDelegateT(container, new Array(32).fill(0), new Array(24).fill(0))));
+  return key;
+}
+
+/** One application message to a registered delegate; resolves with the payload of its reply. */
+async function messageDelegate(key: DelegateKeyT, payload: Uint8Array, timeoutMs?: number): Promise<Uint8Array> {
+  const msg = new InboundDelegateMsgT(InboundDelegateMsgType.common_ApplicationMessage, new ApplicationMessageT(Array.from(payload), [], false));
+  const r = await sendDelegate(new DelegateRequest(DelegateRequestType.ApplicationMessages, new ApplicationMessagesT(key, [], [msg])), timeoutMs);
+  // duck-typed: bundlers can duplicate the SDK classes, which breaks instanceof
+  const m = r.values.map((v) => v.inbound).find((x) => Array.isArray((x as ApplicationMessageT | null)?.payload)) as ApplicationMessageT | undefined;
+  if (!m) throw new Error(`empty delegate reply (the node sent: ${r.values.map((v) => v.inboundType).join(", ") || "nothing"})`);
+  return new Uint8Array(m.payload);
+}
+
+async function registerDelegate() {
+  delegateKey = await registerWasmDelegate(identityWasm);
 }
 
 // every delegate operation is safe to repeat (init keeps the first key, the rest are reads, signatures and overwrites)
 const callDelegate = (payload: object) => retrying(() => callDelegateOnce(payload));
 
 async function callDelegateOnce(payload: object): Promise<Record<string, any>> { // eslint-disable-line @typescript-eslint/no-explicit-any
-  const msg = new InboundDelegateMsgT(InboundDelegateMsgType.common_ApplicationMessage, new ApplicationMessageT(bytes(JSON.stringify(payload)), [], false));
-  const r = await sendDelegate(new DelegateRequest(DelegateRequestType.ApplicationMessages, new ApplicationMessagesT(delegateKey, [], [msg])));
-  // duck-typed: bundlers can duplicate the SDK classes, which breaks instanceof
-  const m = r.values.map((v) => v.inbound).find((x) => Array.isArray((x as ApplicationMessageT | null)?.payload)) as ApplicationMessageT | undefined;
-  if (!m) throw new Error("empty delegate reply");
-  const out = JSON.parse(new TextDecoder().decode(new Uint8Array(m.payload)));
+  const out = JSON.parse(new TextDecoder().decode(await messageDelegate(delegateKey!, enc.encode(JSON.stringify(payload)))));
   if (out.err) throw new Error(out.err);
   return out;
 }
@@ -577,6 +594,73 @@ export async function removeComment(addr: string, params: string, id: string) {
 export function isRemoved(params: string, s: CommentsState, id: string): boolean {
   const owner = params.slice(0, 64), c = s.items[id];
   return `${id}:${owner}` in s.removed || (!!c && `${id}:${c.a}` in s.removed);
+}
+
+// ---------------------------------------------------------------- reports (see reports/src/lib.rs)
+// A report is rate-limited by ante (github.com/soudasuwa/ante): the reporter's node signs a proof of work whose purpose
+// is bound to this exact report, and the contract checks it. The reporter's own node asks for consent first.
+export interface Report extends ReportBody { a: string; proof: string }
+export interface ReportsState { reports: Record<string, Report> }
+
+let repId: Promise<string> | undefined;
+const reportsId = () => (repId ??= keyOf(reportsWasm, new Uint8Array()).then((k) => k.encode()));
+
+/** All reports. The first visitor on a node creates the (empty) contract. */
+export async function loadReports(): Promise<ReportsState> {
+  const id = await reportsId();
+  try { return await getJson<ReportsState>(id); }
+  catch {
+    await putContract(reportsWasm, new Uint8Array(), enc.encode(JSON.stringify({ reports: {} })));
+    return getJson<ReportsState>(id);
+  }
+}
+
+/** Reports of one release, newest first. */
+export const reportsFor = (s: ReportsState, target: string) =>
+  Object.values(s.reports).filter((r) => r.target === target).sort((a, b) => b.ts - a.ts);
+
+const CONSENT_MS = 75_000; // the node keeps the consent prompt open for 60 s
+let anteKey: Promise<DelegateKeyT> | undefined;
+async function anteCall(req: CborValue, timeoutMs?: number) {
+  const key = await (anteKey ??= registerWasmDelegate(anteWasm, ANTE_CODE_HASH).catch((e) => { anteKey = undefined; throw e; }));
+  const out = enumVariant(cborDecode(await messageDelegate(key, cborEncode(req), timeoutMs)));
+  if (out.variant === "Error") throw new Error(`ante: ${String(mapGet(out.fields!, "message"))}`);
+  return out;
+}
+
+export interface ReportInput { target: string; track: number; kind: Kind; note: string; contact: string }
+export class ReportDeclined extends Error { constructor() { super("You declined to spend the work."); } }
+
+/**
+ * File a report: get consent on the reporter's node, grind about a second or two of proof of work, have the node sign
+ * it, and send it to the reports contract. `step` narrates what is happening.
+ */
+export async function sendReport(input: ReportInput, step: (msg: string) => void = () => {}) {
+  const body: ReportBody = { ...input, note: clean(input.note, 300), contact: clean(input.contact, 100), ts: Date.now() };
+  const purpose = reportPurpose(body);
+  step("Opening your ante identity…");
+  const vk = asBytes(mapGet((await anteCall("GetIdentity")).fields!, "verifying_key"));
+  step("Your Freenet node asks you to allow the work. Approve it there…");
+  const grant = await anteCall({ RequestGrind: { purpose, min_bits: REPORT_BITS } }, CONSENT_MS);
+  if (grant.variant === "Denied") throw new ReportDeclined();
+  const challenge = asBytes(mapGet(grant.fields!, "bytes"));
+  if (hex(challenge) !== hex(challengeBytes(purpose, vk))) throw new Error("ante returned an unexpected challenge");
+  step("Working… (anti-spam proof, a few seconds)");
+  const nonce = await grind(challenge, REPORT_BITS, (n) => step(`Working… ${n.toLocaleString()} tries`));
+  step("Signing…");
+  const signed = await anteCall({ Commit: { purpose, nonce, min_bits: REPORT_BITS, ts: Date.now() } }, CONSENT_MS);
+  if (signed.variant === "Denied") throw new ReportDeclined();
+  const proof = asBytes(mapGet(signed.fields!, "proof"));
+  await checkProof(proof, purpose); // catch a bad proof here: the node would only answer "Request timeout"
+  step("Publishing…");
+  await submitReport({ ...body, a: hex(vk), proof: hex(proof) });
+}
+
+/** Send a finished report (with its ante proof) to the reports contract. */
+export async function submitReport(report: Report) {
+  const id = await reportsId();
+  await loadReports(); // makes sure it exists and caches its full key for the update
+  await retrying(() => sendDelta(id, { reports: { [`${report.target}:${report.track}:${report.a}`]: report } }));
 }
 
 // ---------------------------------------------------------------- MP3
