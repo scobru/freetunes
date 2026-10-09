@@ -311,10 +311,50 @@ export async function restoreBackup(b: Backup): Promise<Identity> {
   return me;
 }
 
-/** Start over with a fresh key. The old one is gone unless it was backed up. */
-export async function replaceIdentity(): Promise<Identity> {
+/** Replace the identity with a fresh key, or with `sk` (hex). The old one is gone unless it was backed up. */
+export async function replaceIdentity(sk?: string): Promise<Identity> {
   const s = await keyStore();
-  return asIdentity(s, await s.replace(newSecret()));
+  return asIdentity(s, await s.replace(sk ?? newSecret()));
+}
+
+// ---- importing from a pasted text: a FreeTunes backup, or a whoiam master seed ----
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+/** Base58 (Bitcoin alphabet), the way whoiam and Freenet show public keys. */
+export function toBase58(b: Uint8Array): string {
+  const d: number[] = [];
+  for (const byte of b) {
+    let carry = byte;
+    for (let i = 0; i < d.length; i++) { carry += d[i] << 8; d[i] = carry % 58; carry = (carry / 58) | 0; }
+    while (carry) { d.push(carry % 58); carry = (carry / 58) | 0; }
+  }
+  let out = "";
+  for (const byte of b) { if (byte) break; out += "1"; }
+  return out + d.reverse().map((x) => B58[x]).join("");
+}
+
+export interface Candidate { label: string; sk: string; pk: string }
+
+/** The first 64 hex characters standing alone in a text (a whoiam backup file has them under "hex:"). */
+export function findSeed(text: string): string | null {
+  return text.match(/(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/)?.[0].toLowerCase() ?? null;
+}
+
+/**
+ * The keys a 64-hex value can stand for: itself as a raw key, and the first `count` personas of a whoiam master seed.
+ * whoiam derives persona i as blake3.derive_key("whoiam identity v1", seed || i as 4 bytes little-endian);
+ * the public key is what whoiam shows for that persona, so the user can pick the right one. Only the chosen
+ * persona's key is imported, never the master seed.
+ */
+export async function candidatesFor(hexValue: string, count = 8): Promise<Candidate[]> {
+  const seed = unhex(hexValue), ctx = enc.encode("whoiam identity v1");
+  const make = async (label: string, sk: Uint8Array): Promise<Candidate> => ({ label, sk: hex(sk), pk: toBase58(await ed.getPublicKeyAsync(sk)) });
+  const personas = Array.from({ length: count }, (_, i) => {
+    const ikm = new Uint8Array(36);
+    ikm.set(seed);
+    new DataView(ikm.buffer).setUint32(32, i, true);
+    return make(`whoiam persona #${i + 1}`, blake3(ikm, { context: ctx }));
+  });
+  return [...(await Promise.all(personas)), await make("Use the value itself as the key", seed)];
 }
 
 // small per-app store (artist name, my releases): the delegate when available, else localStorage, else memory

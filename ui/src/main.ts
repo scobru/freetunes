@@ -1,9 +1,9 @@
 import "./style.css";
 import {
-  backupIsEncrypted, blockReleases, createIdentity, deleteRelease, flushKnown, fmtTime, getChunk, LICENSES, listRelease,
+  backupIsEncrypted, blockReleases, candidatesFor, createIdentity, deleteRelease, findSeed, flushKnown, fmtTime, getChunk, LICENSES, listRelease,
   loadDirectory, loadRelease, makeBackup, makeCover, onRemoteChange, peekIdentity, publishRelease, putChunk, readBackup,
   replaceIdentity, restoreBackup, splitMp3, storeGet, storePut, Streamer, updateRelease, watchRelease,
-  type ChunkRef, type Identity, type Mp3Piece, type Release, type TrackMeta,
+  type Candidate, type ChunkRef, type Identity, type Mp3Piece, type Release, type TrackMeta,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -399,35 +399,65 @@ async function identityPage() {
     a.click();
   };
 
-  /** Import form shared by the "no identity" and "have identity" views. */
+  /** Import card shared by the "no identity" and "have identity" views: paste text, or pick a file that fills the box. */
   const importCard = (replacing: boolean) => `
     <div class="card">
-      <h2>Import a backup</h2>
-      <p class="muted">${replacing ? "This <b>replaces</b> your current identity. You will lose control of the releases made with it unless you exported it first." : "Restore an identity from a backup file, on this node or a new one."}</p>
-      <input id="bfile" type="file" accept=".json,application/json" />
+      <h2>Import an identity</h2>
+      <p class="muted">${replacing ? "This <b>replaces</b> your current identity. You will lose control of the releases made with it unless you exported it first." : "Restore an identity on this node or a new one."}
+        Paste a FreeTunes backup or a <b>whoiam master seed</b> (its backup text, or just the 64-character hex).</p>
+      <textarea id="bpaste" rows="4" spellcheck="false" autocomplete="off" placeholder="Paste here"></textarea>
+      <label class="drop small" id="bdrop"><input id="bfile" type="file" accept=".json,.txt,application/json,text/plain" />or choose a file</label>
+      <div id="bchoices" class="choices" hidden></div>
       <label class="field" id="bpass-row" hidden><span>Passphrase</span><input id="bpass" type="password" autocomplete="off" /></label>
       ${replacing ? `<label class="check"><input id="bsure" type="checkbox" />I understand that this replaces my current identity.</label>` : ""}
-      <div class="actions"><button id="bgo" type="button" ${replacing ? "disabled" : ""}>Import</button><span id="bmsg" class="muted"></span></div>
+      <div class="actions"><button id="bgo" type="button" disabled>Import</button><span id="bmsg" class="muted"></span></div>
     </div>`;
 
   const wireImport = (replacing: boolean, after: () => void) => {
-    const file = $<HTMLInputElement>("#bfile"), pass = $<HTMLInputElement>("#bpass"), go = $<HTMLButtonElement>("#bgo"), msg = $("#bmsg");
-    const sure = app.querySelector<HTMLInputElement>("#bsure");
-    const refresh = () => { go.disabled = !file.files?.length || (replacing && !sure?.checked); };
-    file.onchange = async () => {
-      refresh();
-      msg.textContent = "";
-      try { $("#bpass-row").hidden = !backupIsEncrypted(await file.files![0].text()); }
-      catch (e) { msg.textContent = String((e as Error).message ?? e); }
+    const paste = $<HTMLTextAreaElement>("#bpaste"), pass = $<HTMLInputElement>("#bpass"), go = $<HTMLButtonElement>("#bgo"), msg = $("#bmsg");
+    const sure = app.querySelector<HTMLInputElement>("#bsure"), choices = $("#bchoices");
+    let kind: "backup" | "keys" | null = null; // what the pasted text turned out to be
+    const ready = () => (go.disabled = !(kind === "backup" || (kind === "keys" && !!choices.querySelector("input:checked"))) || (replacing && !sure?.checked));
+
+    const analyze = async () => {
+      const text = paste.value.trim();
+      kind = null; choices.hidden = true; choices.innerHTML = ""; $("#bpass-row").hidden = true; msg.textContent = "";
+      if (text) {
+        try {
+          if (text.startsWith("{")) { $("#bpass-row").hidden = !backupIsEncrypted(text); kind = "backup"; }
+          else {
+            const seed = findSeed(text);
+            if (!seed) throw new Error("Not recognised: paste a FreeTunes backup or a whoiam master seed.");
+            const cands = await candidatesFor(seed);
+            choices.innerHTML = `<p class="muted"><small>Pick the persona whose public key matches the one whoiam shows. Only that key is imported, never the master seed.</small></p>` +
+              cands.map((c, k) => `<label class="check"><input type="radio" name="cand" value="${k}" /><span><b>${esc(c.label)}</b><br /><code>${esc(c.pk)}</code></span></label>`).join("");
+            choices.hidden = false;
+            choices.querySelectorAll("input").forEach((r) => (r.onchange = ready));
+            (choices as HTMLElement & { cands?: typeof cands }).cands = cands;
+            kind = "keys";
+          }
+        } catch (e) { msg.textContent = String((e as Error).message ?? e); }
+      }
+      ready();
     };
-    if (sure) sure.onchange = refresh;
+    paste.oninput = () => void analyze();
+    $<HTMLInputElement>("#bfile").onchange = async (e) => {
+      const f = (e.target as HTMLInputElement).files?.[0];
+      if (f) { paste.value = await f.text(); await analyze(); }
+    };
+    if (sure) sure.onchange = ready;
     go.onclick = async () => {
       go.disabled = true;
       try {
         msg.textContent = "Importing...";
-        await restoreBackup(await readBackup(await file.files![0].text(), pass.value));
+        if (kind === "backup") await restoreBackup(await readBackup(paste.value.trim(), pass.value));
+        else {
+          const cands = (choices as HTMLElement & { cands?: Candidate[] }).cands!;
+          await replaceIdentity(cands[+choices.querySelector<HTMLInputElement>("input:checked")!.value].sk);
+        }
+        paste.value = "";
         after();
-      } catch (e) { msg.textContent = String((e as Error).message ?? e); go.disabled = false; }
+      } catch (e) { msg.textContent = String((e as Error).message ?? e); ready(); }
     };
   };
 

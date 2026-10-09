@@ -45,7 +45,7 @@ button:disabled { opacity: .5; cursor: default; }
 .btn.small { padding: 6px 14px; font-size: .9rem; }
 input, select, textarea { font: inherit; color: var(--fg); background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; width: 100%; }
 input:focus, select:focus, textarea:focus, button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-input[type=checkbox] { width: auto; accent-color: var(--accent); margin: 3px 10px 0 0; flex: none; }
+input[type=checkbox], input[type=radio] { width: auto; accent-color: var(--accent); margin: 4px 10px 0 0; flex: none; }
 input[type=file] { padding: 8px; }
 label { display: block; }
 label.check { display: flex; align-items: flex-start; margin: 10px 0; font-size: .92rem; }
@@ -138,3 +138,8 @@ progress::-moz-progress-bar { background: var(--grad); }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
 code { background: var(--surface-2); border: 1px solid var(--line); padding: 2px 7px; border-radius: 6px; font-size: .9em; }
+.drop.small { padding: 10px 12px; margin: 8px 0; font-size: .9rem; }
+.choices { margin: 8px 0; }
+.choices .check { align-items: flex-start; }
+.choices code { word-break: break-all; }
+textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; }

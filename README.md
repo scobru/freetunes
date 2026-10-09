@@ -36,7 +36,9 @@ Tracks are split at MP3 frame boundaries into chunks of about 512 KB, so every c
 An identity is an ed25519 key kept by the identity delegate in your node. It is created **on purpose**, on the Identity page (menu), with an artist name: nothing creates a key for people who only browse and listen, and publishing without one sends you there. Right after creating it the page asks you to download a backup.
 
 - **Export**: a file with the key, the artist name and your list of releases. With a passphrase it is encrypted (AES-GCM, key derived with PBKDF2); without one it is plain JSON, and anyone who has it can publish and edit as you.
-- **Import**: restores an identity from a backup, on this node or a new one, together with the name and the release list. It replaces the current identity, so it asks for confirmation.
+- **Import**: paste text into the box, or pick a file that fills it. It replaces the current identity, so it asks for confirmation. Two kinds of text are recognised:
+  - a **FreeTunes backup** (restores the key, the artist name and your release list, on this node or a new one);
+  - a **[whoiam](https://github.com/skandragon/freenet-whoiam) master seed**: the whole backup text or just its 64-character hex. whoiam derives persona `i` as `blake3.derive_key("whoiam identity v1", seed || i as 4 bytes little-endian)`; FreeTunes lists the first eight personas by public key (the one whoiam shows) and imports only the one you pick, never the master seed. The same key then identifies you in both apps. The 24-word recovery phrase alone is not supported yet: use the hex that sits next to it in the backup file. A pasted 64-hex value can also be used directly as the key.
 - **Start over**: a new key. The old one is gone unless it was exported.
 
 The delegate is optional: if it does not answer, the app falls back to `localStorage`, then to memory, and the Identity page warns that the browser cannot keep the key. The identity otherwise belongs to your node; a backup is how you use it elsewhere.
