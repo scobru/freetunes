@@ -17,6 +17,7 @@ export { personaName };
 import chunkWasm from "./chunk.wasm?url";
 import releaseWasm from "./release.wasm?url";
 import directoryWasm from "./directory.wasm?url";
+import commentsWasm from "./comments.wasm?url";
 import identityWasm from "./identity.wasm?url";
 
 const { bytesToHex: hex, hexToBytes: unhex } = ed.etc;
@@ -48,7 +49,12 @@ export interface ReleaseMeta {
   deleted?: boolean;
   /** Optional: a whoiam persona that vouches for the artist's key. Viewers verify it; the contract ignores it. */
   persona?: WhoiamLink;
+  /** Address of the release's comments contract. Absent on releases published before comments existed. */
+  comments?: string;
 }
+export interface Comment { a: string; name: string; track: number; ts: number; text: string; nonce: number; sig: string }
+export interface Removal { by: string; ts: number; nonce: number; sig: string }
+export interface CommentsState { items: Record<string, Comment>; removed: Record<string, Removal> }
 export interface DirEntry {
   params: string; title: string; artist: string; cover?: string; removed?: boolean; ts: number; nonce: number; sig: string;
 }
@@ -448,7 +454,8 @@ export interface Release {
 export async function publishRelease(meta: Omit<ReleaseMeta, "ts">) {
   const me = await requireIdentity();
   const params = me.pk + hex(crypto.getRandomValues(new Uint8Array(16)));
-  const meta_json = JSON.stringify({ ...meta, ts: Date.now() });
+  const comments = meta.comments ?? (await createComments(params));
+  const meta_json = JSON.stringify({ ...meta, comments, ts: Date.now() });
   const sig = await me.sign(`ftr1|${params}|${meta_json}`);
   const instance = await retrying(() => putContract(releaseWasm, unhex(params), enc.encode(JSON.stringify({ meta_json, sig }))));
   return { instance, params };
@@ -477,8 +484,8 @@ async function pushState(instance: string, params: string, meta: object, current
 }
 
 /** Owner only: replace the release with an edited version. `current` is the timestamp of the version being edited. */
-export const updateRelease = (instance: string, params: string, meta: Omit<ReleaseMeta, "ts">, current: number) =>
-  pushState(instance, params, meta, current);
+export const updateRelease = async (instance: string, params: string, meta: Omit<ReleaseMeta, "ts">, current: number) =>
+  pushState(instance, params, { ...meta, comments: meta.comments ?? (await createComments(params)) }, current);
 
 /**
  * Owner only: take the release down. The state becomes a tombstone without any reference to the audio. The chunks
@@ -513,15 +520,21 @@ const zeroBits = (h: Uint8Array) => {
   return n;
 };
 
+/** Find a nonce so that sha256(`<msg>|<nonce>`) starts with `bits` zero bits (a moment of CPU). */
+async function mine(msg: string, bits: number): Promise<number> {
+  let nonce = 0;
+  while (zeroBits(sha256(enc.encode(`${msg}|${nonce}`))) < bits) {
+    if (++nonce % 20000 === 0) await new Promise((r) => setTimeout(r)); // let the page breathe while mining
+  }
+  return nonce;
+}
+
 /** List a release you own, or (with `removed`) take its entry down: sign it and mine the proof-of-work (a few seconds). */
 export async function listRelease(instance: string, params: string, title: string, artist: string, cover = "", removed = false) {
   const me = await requireIdentity(); // must be the release owner (first 32 bytes of params)
   const ts = Date.now(), msg = `ftl1|${instance}|${params}|${title}|${artist}|${cover}|${ts}|${removed ? 1 : 0}`;
   const sig = await me.sign(msg);
-  let nonce = 0;
-  while (zeroBits(sha256(enc.encode(`${msg}|${nonce}`))) < POW_BITS) {
-    if (++nonce % 20000 === 0) await new Promise((r) => setTimeout(r)); // let the page breathe while mining
-  }
+  const nonce = await mine(msg, POW_BITS);
   await loadDirectory(); // makes sure it exists and caches its full key for the update
   await sendDelta(await directoryId(), { entries: { [instance]: { params, title, artist, cover, removed, ts, nonce, sig } } });
 }
@@ -532,6 +545,38 @@ export async function blockReleases(adminSecretHex: string, list: string[]) {
   const sig = hex(await ed.signAsync(enc.encode(`ftb1|${ts}|${list.join(",")}`), unhex(adminSecretHex)));
   await loadDirectory();
   await sendDelta(await directoryId(), { blocked: { ts, list, sig } });
+}
+
+// ---------------------------------------------------------------- comments (see comments/src/lib.rs)
+const COMMENT_POW_BITS = 16; // must match the contract (about a second of CPU)
+
+/** The comments contract of a release. Its address follows from the release parameters, and anyone can create it. */
+export const createComments = (params: string) =>
+  retrying(() => putContract(commentsWasm, unhex(params), enc.encode(JSON.stringify({ items: {}, removed: {} }))));
+
+export const loadComments = (addr: string) => getJson<CommentsState>(addr);
+
+/** Post a comment on a track. Needs an identity; the proof-of-work makes spam cost something. */
+export async function postComment(addr: string, params: string, track: number, name: string, text: string) {
+  const me = await requireIdentity();
+  const ts = Date.now(), msg = `ftc1|${params}|${me.pk}|${track}|${ts}|${name}|${text}`;
+  const sig = await me.sign(msg), nonce = await mine(msg, COMMENT_POW_BITS);
+  const id = hex(sha256(enc.encode(msg))).slice(0, 32); // the contract derives the same id from the content
+  await retrying(() => sendDelta(addr, { items: { [id]: { a: me.pk, name, track, ts, text, nonce, sig } } }));
+}
+
+/** Remove a comment: allowed for its author and for the release owner (anyone else's removal is ignored). */
+export async function removeComment(addr: string, params: string, id: string) {
+  const me = await requireIdentity();
+  const ts = Date.now(), msg = `ftc2|${params}|${id}|${ts}`;
+  const sig = await me.sign(msg), nonce = await mine(msg, COMMENT_POW_BITS);
+  await retrying(() => sendDelta(addr, { removed: { [`${id}:${me.pk}`]: { by: me.pk, ts, nonce, sig } } }));
+}
+
+/** Is this comment hidden? Same rule as the contract: a removal by its author or by the release owner. */
+export function isRemoved(params: string, s: CommentsState, id: string): boolean {
+  const owner = params.slice(0, 64), c = s.items[id];
+  return `${id}:${owner}` in s.removed || (!!c && `${id}:${c.a}` in s.removed);
 }
 
 // ---------------------------------------------------------------- MP3

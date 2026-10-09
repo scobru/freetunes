@@ -143,3 +143,18 @@ code { background: var(--surface-2); border: 1px solid var(--line); padding: 2px
 .choices .check { align-items: flex-start; }
 .choices code { word-break: break-all; }
 textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; }
+
+/* ---- comments ---- */
+ol.tracks li { flex-wrap: wrap; }
+.cbtn { margin-left: auto; padding: 4px 10px; gap: 6px; font-size: .85rem; color: var(--muted); }
+.cbtn svg { width: 14px; height: 14px; fill: currentColor; }
+.cbtn[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+.cpanel { flex-basis: 100%; padding: 6px 0 4px 50px; }
+.cpanel .notice { margin: 8px 0; }
+.comment { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.comment:last-of-type { border-bottom: 0; }
+.comment p { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chead small { margin-left: 6px; }
+button.link { background: none; border: 0; padding: 0; color: var(--muted); font-size: .8rem; font-weight: 500; text-decoration: underline; }
+button.link:hover:not(:disabled) { color: var(--danger); }
+@media (max-width: 640px) { .cpanel { padding-left: 0; } }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["chunk", "release", "directory", "delegate"]
+members = ["chunk", "release", "directory", "delegate", "comments"]
 resolver = "2"
 
 [profile.release]

@@ -1,9 +1,9 @@
 import "./style.css";
 import {
   backupIsEncrypted, blockReleases, clearLink, createIdentity, currentLink, deleteRelease, finishLink, flushKnown, fmtTime, getChunk,
-  LICENSES, listRelease, loadDirectory, loadRelease, makeBackup, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
-  putChunk, readBackup, replaceIdentity, restoreBackup, splitMp3, startLink, storeGet, storePut, Streamer, updateRelease,
-  verifyLink, watchRelease, type ChunkRef, type Identity, type Mp3Piece, type Release, type TrackMeta,
+  isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeBackup, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
+  postComment, putChunk, readBackup, removeComment, replaceIdentity, restoreBackup, splitMp3, startLink, storeGet, storePut, Streamer, updateRelease,
+  verifyLink, watchRelease, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -22,6 +22,7 @@ const RIGHTS_TEXT =
   "Creative Commons). I understand that it will be public and permanent: Freenet cannot erase it.";
 
 const ICON_PLAY = `<svg class="play-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5v13l11-6.5z"/></svg>`;
+const ICON_CHAT = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2.5h12v8H8.5L5 13.5v-3H2z"/></svg>`;
 const ICON_PAUSE = `<svg class="pause-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h3.5v13H3zM9.5 1.5H13v13H9.5z"/></svg>`;
 
 // route: #/ explore | #/publish | #/identity | #/r/<id>.<params> | #/edit/<id>.<params> | #/admin (not linked anywhere)
@@ -246,7 +247,7 @@ function releaseForm(existing?: Release) {
         tracks.push({ title: it.title.trim(), chunks });
       }
       await flushKnown();
-      const meta = { title, artist, license, rights: true, cover, tracks, persona: (await currentLink()) ?? undefined };
+      const meta = { title, artist, license, rights: true, cover, tracks, persona: (await currentLink()) ?? undefined, comments: m?.comments };
       msg.textContent = edit ? "Saving..." : "Publishing the release...";
       let instance: string, params: string;
       if (existing) {
@@ -306,7 +307,9 @@ async function releasePage(instance: string, params: string) {
     <ol class="tracks">${m.tracks.map((t, i) => `
       <li data-i="${i}"><button type="button" class="play" aria-label="Play ${esc(t.title)}">${ICON_PLAY}${ICON_PAUSE}</button>
         <span class="tt">${esc(t.title)}</span><span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>
-        <small class="muted">${fmtTime(t.chunks.reduce((s, c) => s + c.ms, 0))}</small></li>`).join("")}</ol>
+        <small class="muted">${fmtTime(t.chunks.reduce((s, c) => s + c.ms, 0))}</small>
+        <button type="button" class="cbtn" data-c="${i}" aria-expanded="false" aria-label="Comments on ${esc(t.title)}">${ICON_CHAT}<span class="cn"></span></button>
+        <div class="cpanel" hidden></div></li>`).join("")}</ol>
     <label class="field share"><span>Link to share</span><input readonly value="${esc(pageUrl(hash))}" onfocus="this.select()" /></label>
     <p class="notice">The artist declared having the right to publish this music. FreeTunes is an experiment and cannot verify that claim or erase a release.</p>
     <div id="confirm"></div>`;
@@ -330,7 +333,83 @@ async function releasePage(instance: string, params: string) {
   audio.onpause = () => rows[current]?.classList.remove("playing");
   audio.onended = () => { if (current + 1 < m.tracks.length) start(current + 1); };
 
-  const off = onRemoteChange(() => { if (location.hash === hash) $("#changed").hidden = false; });
+  // ---- comments: everyone reads, only people with an identity write ----
+  const owner = params.slice(0, 64);
+  let cs: CommentsState = { items: {}, removed: {} };
+  let me: Identity | null = null, myName = "";
+  const opened = new Set<number>();
+  const panels = rows.map((li) => $<HTMLElement>(".cpanel", li));
+  const meReady = peekIdentity().then((i) => (me = i), () => null);
+  void Promise.all([storeGet("commentname"), storeGet("artist")]).then(([a, b]) => (myName = a ?? b ?? ""));
+
+  const visible = (t: number) =>
+    Object.entries(cs.items).filter(([id, c]) => c.track === t && !isRemoved(params, cs, id)).sort(([, a], [, b]) => a.ts - b.ts);
+  const drawCounts = () => rows.forEach((li, t) => { $(".cn", li).textContent = String(visible(t).length || ""); });
+  const reloadComments = async () => { cs = await loadComments(m.comments!); drawCounts(); opened.forEach(drawList); };
+
+  function drawList(t: number) {
+    const box = $(".clist", panels[t]), items = visible(t);
+    box.innerHTML = items.length ? items.map(([id, c]) => `
+      <div class="comment"><div class="chead"><b>${esc(c.name || "anonymous")}</b>${c.a === owner ? ` <span class="chip hot">artist</span>` : ""}
+        <small class="muted">${esc(c.a.slice(0, 8))}\u2026 \u00b7 ${new Date(c.ts).toLocaleString()}</small></div>
+        <p>${esc(c.text)}</p>${me && (me.pk === c.a || me.pk === owner) ? `<button type="button" class="link" data-rm="${id}">Remove</button>` : ""}</div>`).join("")
+      : `<p class="muted">No comments on this track yet.</p>`;
+    box.querySelectorAll<HTMLButtonElement>("[data-rm]").forEach((b) => (b.onclick = async () => {
+      if (b.dataset.sure !== "1") { // two clicks, so a stray click does not remove anything
+        b.dataset.sure = "1"; b.textContent = "Click again to remove";
+        setTimeout(() => { b.dataset.sure = ""; b.textContent = "Remove"; }, 4000);
+        return;
+      }
+      b.disabled = true; b.textContent = "Removing...";
+      try { await removeComment(m.comments!, params, b.dataset.rm!); await reloadComments(); }
+      catch (e) { b.textContent = `Error: ${(e as Error).message ?? e}`; }
+    }));
+  }
+
+  function buildPanel(t: number) {
+    const p = panels[t];
+    const body = !m.comments
+      ? `<p class="muted"><small>Comments are not available on this release${me?.pk === owner && !rel.legacy ? ": edit it to turn them on." : ", which was published before comments existed."}</small></p>`
+      : me
+        ? `<label class="field"><span>Your name</span><input class="cname" maxlength="40" value="${esc(myName)}" /></label>
+           <textarea class="ctext" rows="3" maxlength="500" placeholder="Write a comment"></textarea>
+           <div class="actions"><button type="button" class="primary cpost">Post comment</button><span class="cmsg muted"></span></div>`
+        : `<div class="notice"><b>Only people with an identity can comment.</b> Everyone can read. <a href="#/identity">Create or import an identity</a> to join in.</div>`;
+    p.innerHTML = `<div class="clist"></div>${body}`;
+    drawList(t);
+    const btn = p.querySelector<HTMLButtonElement>(".cpost");
+    if (btn) btn.onclick = async () => {
+      const name = $<HTMLInputElement>(".cname", p).value.trim(), text = $<HTMLTextAreaElement>(".ctext", p).value.trim(), msg = $(".cmsg", p);
+      if (!text) return void (msg.textContent = "Write something first.");
+      btn.disabled = true; msg.textContent = "Posting (a second of proof-of-work)...";
+      try {
+        await postComment(m.comments!, params, t, name, text);
+        myName = name; void storePut("commentname", name);
+        $<HTMLTextAreaElement>(".ctext", p).value = ""; msg.textContent = "";
+        await reloadComments();
+      } catch (e) { msg.textContent = `Error: ${(e as Error).message ?? e}`; }
+      btn.disabled = false;
+    };
+  }
+
+  rows.forEach((li, t) => ($<HTMLButtonElement>(".cbtn", li).onclick = (e) => {
+    const open = panels[t].hidden;
+    panels[t].hidden = !open;
+    (e.currentTarget as HTMLElement).setAttribute("aria-expanded", String(open));
+    if (open) { opened.add(t); buildPanel(t); } else opened.delete(t);
+  }));
+  void meReady.then(() => opened.forEach(buildPanel)); // the identity may arrive after a panel was opened
+  if (m.comments) {
+    void loadComments(m.comments).then((st) => { cs = st; drawCounts(); opened.forEach(drawList); }).catch(() => {});
+    void watchRelease(m.comments).catch(() => {});
+  }
+
+  // any subscribed contract can notify us: look at what changed
+  const off = onRemoteChange(async () => {
+    if (location.hash !== hash) return;
+    try { if ((await loadRelease(instance, params)).meta.ts !== m.ts) $("#changed").hidden = false; } catch { /* keep the page as it is */ }
+    if (m.comments) { try { await reloadComments(); } catch { /* keep the page as it is */ } }
+  });
   window.addEventListener("hashchange", off, { once: true });
   $("#refresh").onclick = (e) => { e.preventDefault(); void releasePage(instance, params); };
 
@@ -341,8 +420,8 @@ async function releasePage(instance: string, params: string) {
       if (ok) $(".chips").insertAdjacentHTML("beforeend", `<span class="chip hot" title="whoiam persona ${esc(personaName(p.pk))}">whoiam \u2713 ${esc(personaName(p.pk).slice(0, 8))}\u2026</span>`);
     });
   }
-  void peekIdentity().then((me) => {
-    if (me?.pk !== params.slice(0, 64)) return;
+  void meReady.then((id) => {
+    if (id?.pk !== params.slice(0, 64)) return;
     if (rel.legacy) { // the node would refuse every change, so do not offer them
       $("#owner").innerHTML = `<p class="muted"><small>Published with an older version of FreeTunes: it cannot be edited or removed. Publish it again for a release you can edit.</small></p>`;
       return;
