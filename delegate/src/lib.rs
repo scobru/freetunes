@@ -1,7 +1,8 @@
 //! Identity delegate. Keeps one ed25519 signing key per calling web app (namespaced by the app's
 //! contract id, supplied by the node) and signs messages on request, so the key survives sessions
 //! even where the page has no storage. It also keeps a small per-app key/value store (the poll list,
-//! the owner's invite links). Messages are JSON in the ApplicationMessage payload.
+//! the owner's invite links). The owner can export the key (to back it up) and replace it (to restore a
+//! backup), both only on explicit request. Messages are JSON in the ApplicationMessage payload.
 use ed25519_dalek::{Signer, SigningKey};
 use freenet_stdlib::prelude::*;
 use serde::Deserialize;
@@ -14,6 +15,10 @@ enum Req {
     Init { sk: String },
     Pubkey,
     Sign { msg: String },
+    /// Hand the secret key back to the page, for a backup the user asked for.
+    Export,
+    /// Overwrite the identity with this secret (hex, 32 bytes), for restoring a backup or starting over.
+    Replace { sk: String },
     Put { key: String, value: String },
     Get { key: String },
 }
@@ -35,6 +40,10 @@ fn kv_name(slot: &str, key: &str) -> Result<String, String> {
     Ok(format!("{slot}/kv/{key}"))
 }
 
+fn parse_sk(sk: &str) -> Result<[u8; 32], String> {
+    hex::decode(sk).map_err(|e| e.to_string())?.try_into().map_err(|_| "secret must be 32 bytes".to_string())
+}
+
 fn key_of(ctx: &DelegateCtx, slot: &str) -> Result<SigningKey, String> {
     let b: [u8; 32] = ctx.get_secret(slot.as_bytes()).ok_or("no identity")?.try_into().map_err(|_| "corrupt secret")?;
     Ok(SigningKey::from_bytes(&b))
@@ -44,14 +53,20 @@ fn run(ctx: &mut DelegateCtx, slot: &str, req: Req) -> Result<Value, String> {
     match req {
         Req::Init { sk } => {
             if !ctx.has_secret(slot.as_bytes()) {
-                let b: [u8; 32] = hex::decode(sk).map_err(|e| e.to_string())?.try_into().map_err(|_| "secret must be 32 bytes")?;
-                if !ctx.set_secret(slot.as_bytes(), &b) {
+                if !ctx.set_secret(slot.as_bytes(), &parse_sk(&sk)?) {
                     return Err("could not store the secret".into());
                 }
             }
             run(ctx, slot, Req::Pubkey)
         }
         Req::Pubkey => Ok(json!({ "pk": hex::encode(key_of(ctx, slot)?.verifying_key().to_bytes()) })),
+        Req::Export => Ok(json!({ "sk": hex::encode(key_of(ctx, slot)?.to_bytes()) })),
+        Req::Replace { sk } => {
+            if !ctx.set_secret(slot.as_bytes(), &parse_sk(&sk)?) {
+                return Err("could not store the secret".into());
+            }
+            run(ctx, slot, Req::Pubkey)
+        }
         Req::Sign { msg } => Ok(json!({ "sig": hex::encode(key_of(ctx, slot)?.sign(msg.as_bytes()).to_bytes()) })),
         Req::Put { key, value } => {
             if value.len() > MAX_VALUE {
@@ -108,6 +123,15 @@ mod tests {
     fn requests_parse() {
         assert!(matches!(serde_json::from_str::<Req>(r#"{"op":"pubkey"}"#), Ok(Req::Pubkey)));
         assert!(matches!(serde_json::from_str::<Req>(r#"{"op":"get","key":"polls"}"#), Ok(Req::Get { .. })));
+        assert!(matches!(serde_json::from_str::<Req>(r#"{"op":"export"}"#), Ok(Req::Export)));
+        assert!(matches!(serde_json::from_str::<Req>(r#"{"op":"replace","sk":"00"}"#), Ok(Req::Replace { .. })));
         assert!(serde_json::from_str::<Req>(r#"{"op":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn secrets_must_be_32_bytes_of_hex() {
+        assert!(parse_sk(&"ab".repeat(32)).is_ok());
+        assert!(parse_sk(&"ab".repeat(31)).is_err());
+        assert!(parse_sk("not hex").is_err());
     }
 }

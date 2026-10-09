@@ -136,3 +136,5 @@ progress::-moz-progress-bar { background: var(--grad); }
   ol#tracklist li .tag, ol#tracklist li small { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+code { background: var(--surface-2); border: 1px solid var(--line); padding: 2px 7px; border-radius: 6px; font-size: .9em; }

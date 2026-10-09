@@ -1,8 +1,9 @@
 import "./style.css";
 import {
-  blockReleases, deleteRelease, flushKnown, fmtTime, getChunk, identity, LICENSES, listRelease, loadDirectory,
-  loadRelease, makeCover, onRemoteChange, publishRelease, putChunk, splitMp3, storeGet, storePut, Streamer,
-  updateRelease, watchRelease, type ChunkRef, type Mp3Piece, type Release, type TrackMeta,
+  backupIsEncrypted, blockReleases, createIdentity, deleteRelease, flushKnown, fmtTime, getChunk, LICENSES, listRelease,
+  loadDirectory, loadRelease, makeBackup, makeCover, onRemoteChange, peekIdentity, publishRelease, putChunk, readBackup,
+  replaceIdentity, restoreBackup, splitMp3, storeGet, storePut, Streamer, updateRelease, watchRelease,
+  type ChunkRef, type Identity, type Mp3Piece, type Release, type TrackMeta,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -23,15 +24,16 @@ const RIGHTS_TEXT =
 const ICON_PLAY = `<svg class="play-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5v13l11-6.5z"/></svg>`;
 const ICON_PAUSE = `<svg class="pause-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h3.5v13H3zM9.5 1.5H13v13H9.5z"/></svg>`;
 
-// route: #/ explore | #/publish | #/r/<id>.<params> | #/edit/<id>.<params> | #/admin (not linked anywhere)
+// route: #/ explore | #/publish | #/identity | #/r/<id>.<params> | #/edit/<id>.<params> | #/admin (not linked anywhere)
 function route() {
   // inside the Freenet container, keep the address bar in sync so the URL is shareable
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
   const h = location.hash;
-  document.querySelectorAll("[data-nav]").forEach((a) =>
-    a.toggleAttribute("aria-current", (a.getAttribute("data-nav") === "publish") === (h === "#/publish") && (h === "#/publish" || h === "" || h === "#/")));
+  const here = h === "#/publish" ? "publish" : h === "#/identity" ? "identity" : h === "" || h === "#/" ? "explore" : "";
+  document.querySelectorAll<HTMLElement>("[data-nav]").forEach((a) => a.toggleAttribute("aria-current", a.dataset.nav === here));
   window.scrollTo(0, 0);
-  if (h === "#/publish") return releaseForm();
+  if (h === "#/publish") return publishPage();
+  if (h === "#/identity") return identityPage();
   if (h === "#/admin") return admin();
   const m = h.match(/^#\/(r|edit)\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96})$/);
   if (m?.[1] === "edit") return editPage(m[2], m[3]);
@@ -106,8 +108,8 @@ async function editPage(instance: string, params: string) {
   app.innerHTML = `<p class="muted">Loading...</p>`;
   try {
     const rel = await loadRelease(instance, params);
-    const me = await identity();
-    if (me.pk !== params.slice(0, 64)) return void (app.innerHTML = `<div class="gone"><h1>Not your release</h1><p class="muted">Only the artist who published it can edit it, from the node where they published.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
+    const me = await peekIdentity();
+    if (me?.pk !== params.slice(0, 64)) return void (app.innerHTML = `<div class="gone"><h1>Not your release</h1><p class="muted">Only the artist who published it can edit it, from the node where they published.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
     if (rel.meta.deleted) return void (app.innerHTML = `<div class="gone"><h1>Release removed</h1><a class="btn" href="#/">Back</a></div>`);
     if (rel.legacy) return void (app.innerHTML = `<div class="gone"><h1>Cannot edit this release</h1><p class="muted">It was published with an older version of FreeTunes, before editing existed. Publish it again to get a release you can edit.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
     return releaseForm(rel);
@@ -331,8 +333,8 @@ async function releasePage(instance: string, params: string) {
   $("#refresh").onclick = (e) => { e.preventDefault(); void releasePage(instance, params); };
 
   // owner tools: only the artist's own key matches the first 32 bytes of the contract parameters
-  void identity().then((me) => {
-    if (me.pk !== params.slice(0, 64)) return;
+  void peekIdentity().then((me) => {
+    if (me?.pk !== params.slice(0, 64)) return;
     if (rel.legacy) { // the node would refuse every change, so do not offer them
       $("#owner").innerHTML = `<p class="muted"><small>Published with an older version of FreeTunes: it cannot be edited or removed. Publish it again for a release you can edit.</small></p>`;
       return;
@@ -369,6 +371,129 @@ function confirmRemoval(rel: Release) {
       location.hash = "#/";
     } catch (e) { msg.textContent = `Error: ${e}`; yes.disabled = false; }
   };
+}
+
+// ---------------- identity ----------------
+const shortKey = (pk: string) => `${pk.slice(0, 8)}\u2026${pk.slice(-8)}`;
+
+/** Publishing needs an identity. Listening does not, so nothing creates one until the user chooses to. */
+async function publishPage() {
+  if (await peekIdentity()) return releaseForm();
+  app.innerHTML = `
+    <h1>Publish a release</h1>
+    <div class="card">
+      <h2>First, an identity</h2>
+      <p class="muted">An identity is the key that proves a release is yours and lets you edit or remove it later. Create one, or import a backup if you already have one.</p>
+      <div class="actions"><a class="btn primary" href="#/identity">Create or import an identity</a></div>
+    </div>`;
+}
+
+/** Create, back up, import and replace the identity. */
+async function identityPage() {
+  app.innerHTML = `<h1>Identity</h1><div id="idbox"><p class="muted">Loading...</p></div>`;
+  const box = $("#idbox");
+  const download = (text: string, pk: string) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+    a.download = `freetunes-identity-${pk.slice(0, 8)}.json`;
+    a.click();
+  };
+
+  /** Import form shared by the "no identity" and "have identity" views. */
+  const importCard = (replacing: boolean) => `
+    <div class="card">
+      <h2>Import a backup</h2>
+      <p class="muted">${replacing ? "This <b>replaces</b> your current identity. You will lose control of the releases made with it unless you exported it first." : "Restore an identity from a backup file, on this node or a new one."}</p>
+      <input id="bfile" type="file" accept=".json,application/json" />
+      <label class="field" id="bpass-row" hidden><span>Passphrase</span><input id="bpass" type="password" autocomplete="off" /></label>
+      ${replacing ? `<label class="check"><input id="bsure" type="checkbox" />I understand that this replaces my current identity.</label>` : ""}
+      <div class="actions"><button id="bgo" type="button" ${replacing ? "disabled" : ""}>Import</button><span id="bmsg" class="muted"></span></div>
+    </div>`;
+
+  const wireImport = (replacing: boolean, after: () => void) => {
+    const file = $<HTMLInputElement>("#bfile"), pass = $<HTMLInputElement>("#bpass"), go = $<HTMLButtonElement>("#bgo"), msg = $("#bmsg");
+    const sure = app.querySelector<HTMLInputElement>("#bsure");
+    const refresh = () => { go.disabled = !file.files?.length || (replacing && !sure?.checked); };
+    file.onchange = async () => {
+      refresh();
+      msg.textContent = "";
+      try { $("#bpass-row").hidden = !backupIsEncrypted(await file.files![0].text()); }
+      catch (e) { msg.textContent = String((e as Error).message ?? e); }
+    };
+    if (sure) sure.onchange = refresh;
+    go.onclick = async () => {
+      go.disabled = true;
+      try {
+        msg.textContent = "Importing...";
+        await restoreBackup(await readBackup(await file.files![0].text(), pass.value));
+        after();
+      } catch (e) { msg.textContent = String((e as Error).message ?? e); go.disabled = false; }
+    };
+  };
+
+  const draw = async (justCreated = false) => {
+    let me: Identity | null;
+    try { me = await peekIdentity(); } catch (e) { box.innerHTML = `<p class="err">Could not read the identity: ${esc(String(e))}</p>`; return; }
+
+    if (!me) {
+      box.innerHTML = `
+        <p class="muted">Your identity is a key that proves your releases are yours and lets you edit or remove them. It is created on your node. Back it up to use it elsewhere or to recover it.</p>
+        <div class="card">
+          <h2>Create your identity</h2>
+          <label class="field"><span>Artist name</span><input id="name" maxlength="80" placeholder="Used as the default artist when you publish" /></label>
+          <div class="actions"><button id="create" class="primary" type="button">Create identity</button><span id="msg" class="muted"></span></div>
+        </div>${importCard(false)}`;
+      $("#create").onclick = async () => {
+        const btn = $<HTMLButtonElement>("#create");
+        btn.disabled = true;
+        try {
+          $("#msg").textContent = "Creating...";
+          await createIdentity();
+          const name = $<HTMLInputElement>("#name").value.trim();
+          if (name) await storePut("artist", name);
+          await draw(true);
+        } catch (e) { $("#msg").textContent = `Error: ${e}`; btn.disabled = false; }
+      };
+      wireImport(false, () => void draw());
+      return;
+    }
+
+    const name = (await storeGet("artist")) ?? "";
+    box.innerHTML = `
+      ${justCreated ? `<p class="notice"><b>Identity created. Download a backup now.</b> If you lose this node or clear its data, the backup is the only way to edit or remove your releases again.</p>` : ""}
+      ${me.persisted ? "" : `<p class="notice"><b>This browser cannot keep your key between visits.</b> Download a backup and import it when you come back.</p>`}
+      <div class="card">
+        <h2>Your identity</h2>
+        <label class="field"><span>Artist name</span><input id="name" maxlength="80" value="${esc(name)}" /></label>
+        <p class="muted">Public key <code>${esc(shortKey(me.pk))}</code></p>
+        <div class="actions"><button id="savename" type="button">Save name</button><a class="btn primary" href="#/publish">Publish a release</a><span id="nmsg" class="muted"></span></div>
+      </div>
+      <div class="card">
+        <h2>Export a backup</h2>
+        <p class="muted">The file holds your key and your list of releases. <b>Anyone who has it can publish and edit as you.</b> A passphrase encrypts it (recommended); without one it is plain text.</p>
+        <label class="field"><span>Passphrase (optional)</span><input id="epass" type="password" autocomplete="off" /></label>
+        <div class="actions"><button id="export" class="primary" type="button">Download backup</button><span id="emsg" class="muted"></span></div>
+      </div>
+      ${importCard(true)}
+      <div class="card">
+        <h2>Start over</h2>
+        <p class="muted">Create a new identity with a new key. The old one is gone unless you exported it, and so is the control of its releases.</p>
+        <label class="check"><input id="osure" type="checkbox" />I understand that this replaces my current identity.</label>
+        <div class="actions"><button id="fresh" class="danger" type="button" disabled>Create a new identity</button></div>
+      </div>`;
+    $("#savename").onclick = async () => { await storePut("artist", $<HTMLInputElement>("#name").value.trim()); $("#nmsg").textContent = "Saved."; };
+    $("#export").onclick = async () => {
+      try {
+        $("#emsg").textContent = "Preparing...";
+        download(await makeBackup($<HTMLInputElement>("#epass").value), me!.pk);
+        $("#emsg").textContent = "Downloaded. Keep it somewhere safe.";
+      } catch (e) { $("#emsg").textContent = `Error: ${e}`; }
+    };
+    wireImport(true, () => void draw());
+    $<HTMLInputElement>("#osure").onchange = (e) => ($<HTMLButtonElement>("#fresh").disabled = !(e.target as HTMLInputElement).checked);
+    $("#fresh").onclick = async () => { await replaceIdentity(); await draw(true); };
+  };
+  await draw();
 }
 
 // ---------------- admin: hide releases from the directory with the admin key (hash #/admin) ----------------

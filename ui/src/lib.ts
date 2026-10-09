@@ -191,43 +191,136 @@ async function callDelegateOnce(payload: object): Promise<Record<string, any>> {
   return out;
 }
 
-let delegateIdentity: Promise<Identity | null> | undefined;
-function viaDelegate(): Promise<Identity | null> {
-  return (delegateIdentity ??= (async () => {
-    try {
-      const { pk } = await retrying(async () => {
-        await registerDelegate();
-        let sk: string | null = null;
-        try { sk = localStorage.getItem("ft-sk"); } catch { /* sandbox: no storage */ }
-        return callDelegate({ op: "init", sk: sk ?? hex(ed.utils.randomPrivateKey()) });
-      });
-      return { pk, persisted: true, sign: async (msg: string) => (await callDelegate({ op: "sign", msg })).sig };
-    } catch (e) {
-      console.warn("identity delegate unavailable, using a local key:", e);
-      return null;
-    }
-  })());
+// The delegate is optional: if it is missing or silent we fall back to localStorage, then to memory.
+let delegateReady: Promise<boolean> | undefined;
+const hasDelegate = () =>
+  (delegateReady ??= retrying(registerDelegate).then(() => true, (e) => {
+    console.warn("identity delegate unavailable, using the local key store:", e);
+    return false;
+  }));
+
+/** Where the signing key lives. Creating an identity is always an explicit step: nothing here makes one by itself. */
+interface KeyStore {
+  persisted: boolean;
+  pk(): Promise<string | null>; // null when there is no identity yet
+  create(sk: string): Promise<string>; // keeps the existing one, if any
+  replace(sk: string): Promise<string>;
+  exportSk(): Promise<string>;
+  sign(msg: string): Promise<string>;
 }
 
-let memKey: string | undefined;
-export async function identity(): Promise<Identity> {
-  const d = await viaDelegate();
-  if (d) return d;
-  let h: string | null | undefined, persisted = true;
-  try { h = localStorage.getItem("ft-sk"); } catch { persisted = false; h = memKey; }
-  if (!h) {
-    h = hex(ed.utils.randomPrivateKey());
-    try { localStorage.setItem("ft-sk", h); } catch { persisted = false; }
+const delegateStore: KeyStore = {
+  persisted: true,
+  pk: async () => {
+    try { return (await callDelegate({ op: "pubkey" })).pk as string; }
+    catch (e) { if (/no identity/.test(String(e))) return null; throw e; }
+  },
+  create: async (sk) => (await callDelegate({ op: "init", sk })).pk,
+  replace: async (sk) => (await callDelegate({ op: "replace", sk })).pk,
+  exportSk: async () => (await callDelegate({ op: "export" })).sk,
+  sign: async (msg) => (await callDelegate({ op: "sign", msg })).sig,
+};
+
+let memKey: string | null = null;
+let lsWorks = true;
+const readKey = () => { try { return localStorage.getItem("ft-sk"); } catch { lsWorks = false; return memKey; } };
+const writeKey = (h: string) => { memKey = h; try { localStorage.setItem("ft-sk", h); } catch { lsWorks = false; } };
+const localStore: KeyStore = {
+  get persisted() { return lsWorks; },
+  pk: async () => { const h = readKey(); return h ? hex(await ed.getPublicKeyAsync(unhex(h))) : null; },
+  create: async (sk) => { if (!readKey()) writeKey(sk); return hex(await ed.getPublicKeyAsync(unhex(readKey()!))); },
+  replace: async (sk) => { writeKey(sk); return hex(await ed.getPublicKeyAsync(unhex(sk))); },
+  exportSk: async () => { const h = readKey(); if (!h) throw new Error("no identity"); return h; },
+  sign: async (msg) => hex(await ed.signAsync(enc.encode(msg), unhex(readKey()!))),
+};
+
+const keyStore = async () => ((await hasDelegate()) ? delegateStore : localStore);
+const asIdentity = (s: KeyStore, pk: string): Identity => ({ pk, persisted: s.persisted, sign: (m) => s.sign(m) });
+const newSecret = () => hex(ed.utils.randomPrivateKey());
+
+/** The identity, if one exists. Never creates one: listeners and visitors do not need a key. */
+export async function peekIdentity(): Promise<Identity | null> {
+  const s = await keyStore(), pk = await s.pk();
+  return pk ? asIdentity(s, pk) : null;
+}
+
+/** The identity, or an error telling the user to create one. For everything that signs. */
+export async function requireIdentity(): Promise<Identity> {
+  const me = await peekIdentity();
+  if (!me) throw new Error("Create an identity first (Identity in the menu).");
+  return me;
+}
+
+/** Create an identity with a fresh key. If one exists already it is kept. */
+export async function createIdentity(): Promise<Identity> {
+  const s = await keyStore();
+  return asIdentity(s, await s.create(newSecret()));
+}
+
+// ---- backup: a file with the key, the artist name and the list of your releases ----
+export interface Backup { app: "freetunes"; v: 1; sk: string; name: string; releases: unknown; created: number }
+
+async function aesKey(pass: string, salt: Uint8Array) {
+  const base = await crypto.subtle.importKey("raw", enc.encode(pass), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", salt: salt as BufferSource, iterations: 200_000, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+
+/** The backup file's text. With a passphrase the content is encrypted (AES-GCM, key from PBKDF2); without, it is plain JSON. */
+export async function makeBackup(passphrase: string): Promise<string> {
+  const s = await keyStore();
+  if (!(await s.pk())) throw new Error("There is no identity to back up.");
+  const b: Backup = {
+    app: "freetunes", v: 1, sk: await s.exportSk(), created: Date.now(),
+    name: (await storeGet("artist")) ?? "",
+    releases: JSON.parse((await storeGet("releases")) ?? "[]"),
+  };
+  if (!passphrase) return JSON.stringify(b, null, 2);
+  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await aesKey(passphrase, salt), enc.encode(JSON.stringify(b))));
+  return JSON.stringify({ app: "freetunes", v: 1, enc: { salt: hex(salt), iv: hex(iv), data: hex(data) } }, null, 2);
+}
+
+/** Is this backup text encrypted (so a passphrase is needed)? Throws if it is not a FreeTunes backup. */
+export function backupIsEncrypted(text: string): boolean {
+  const j = JSON.parse(text);
+  if (j?.app !== "freetunes") throw new Error("This is not a FreeTunes backup file.");
+  return !!j.enc;
+}
+
+export async function readBackup(text: string, passphrase: string): Promise<Backup> {
+  const j = JSON.parse(text);
+  if (j?.app !== "freetunes") throw new Error("This is not a FreeTunes backup file.");
+  let b = j;
+  if (j.enc) {
+    if (!passphrase) throw new Error("This backup is encrypted: enter its passphrase.");
+    try {
+      const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unhex(j.enc.iv) as BufferSource }, await aesKey(passphrase, unhex(j.enc.salt)), unhex(j.enc.data) as BufferSource);
+      b = JSON.parse(new TextDecoder().decode(plain));
+    } catch { throw new Error("Wrong passphrase, or the file is damaged."); }
   }
-  memKey = h;
-  const sk = unhex(h);
-  return { pk: hex(await ed.getPublicKeyAsync(sk)), persisted, sign: async (m) => hex(await ed.signAsync(enc.encode(m), sk)) };
+  if (!/^[0-9a-f]{64}$/.test(b.sk ?? "")) throw new Error("The backup does not contain a valid key.");
+  return b as Backup;
+}
+
+/** Replace the current identity with the one in a backup, and restore the artist name and your release list. */
+export async function restoreBackup(b: Backup): Promise<Identity> {
+  const s = await keyStore();
+  const me = asIdentity(s, await s.replace(b.sk));
+  await storePut("artist", b.name ?? "");
+  await storePut("releases", JSON.stringify(Array.isArray(b.releases) ? b.releases : []));
+  return me;
+}
+
+/** Start over with a fresh key. The old one is gone unless it was backed up. */
+export async function replaceIdentity(): Promise<Identity> {
+  const s = await keyStore();
+  return asIdentity(s, await s.replace(newSecret()));
 }
 
 // small per-app store (artist name, my releases): the delegate when available, else localStorage, else memory
 const mem = new Map<string, string>();
 export async function storeGet(key: string): Promise<string | null> {
-  const d = await viaDelegate();
+  const d = await hasDelegate();
   let local: string | null = null;
   try { local = localStorage.getItem(`ft-${key}`); } catch { /* sandbox: no storage */ }
   if (d) { try { return (await callDelegate({ op: "get", key })).value ?? local; } catch { /* use local */ } }
@@ -236,7 +329,7 @@ export async function storeGet(key: string): Promise<string | null> {
 export async function storePut(key: string, value: string) {
   mem.set(key, value);
   try { localStorage.setItem(`ft-${key}`, value); } catch { /* sandbox: no storage */ }
-  if (await viaDelegate()) { try { await callDelegate({ op: "put", key, value }); } catch (e) { console.warn("delegate store failed:", e); } }
+  if (await hasDelegate()) { try { await callDelegate({ op: "put", key, value }); } catch (e) { console.warn("delegate store failed:", e); } }
 }
 
 // ---------------------------------------------------------------- chunks
@@ -294,7 +387,7 @@ export interface Release {
 
 /** Publish a release. Parameters = owner pubkey || random salt, so one artist can publish any number of releases. */
 export async function publishRelease(meta: Omit<ReleaseMeta, "ts">) {
-  const me = await identity();
+  const me = await requireIdentity();
   const params = me.pk + hex(crypto.getRandomValues(new Uint8Array(16)));
   const meta_json = JSON.stringify({ ...meta, ts: Date.now() });
   const sig = await me.sign(`ftr1|${params}|${meta_json}`);
@@ -313,7 +406,7 @@ export async function loadRelease(instance: string, params: string): Promise<Rel
 
 /** Sign a new state and send it to the release contract. A newer timestamp wins, so it must beat the current one. */
 async function pushState(instance: string, params: string, meta: object, current: number) {
-  const me = await identity(); // must be the release owner
+  const me = await requireIdentity(); // must be the release owner
   const meta_json = JSON.stringify({ ...meta, ts: Math.max(Date.now(), current + 1) });
   const sig = await me.sign(`ftr1|${params}|${meta_json}`);
   try { await retrying(() => sendDelta(instance, { meta_json, sig })); }
@@ -363,7 +456,7 @@ const zeroBits = (h: Uint8Array) => {
 
 /** List a release you own, or (with `removed`) take its entry down: sign it and mine the proof-of-work (a few seconds). */
 export async function listRelease(instance: string, params: string, title: string, artist: string, cover = "", removed = false) {
-  const me = await identity(); // must be the release owner (first 32 bytes of params)
+  const me = await requireIdentity(); // must be the release owner (first 32 bytes of params)
   const ts = Date.now(), msg = `ftl1|${instance}|${params}|${title}|${artist}|${cover}|${ts}|${removed ? 1 : 0}`;
   const sig = await me.sign(msg);
   let nonce = 0;

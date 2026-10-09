@@ -33,7 +33,13 @@ Tracks are split at MP3 frame boundaries into chunks of about 512 KB, so every c
 
 ### Identity
 
-Registering means that the first time you publish, the delegate creates your key in your node; you only choose an artist name. There are no passwords or emails. The identity belongs to your node: another node is another identity (Freenet does not sync delegates across devices yet). If the delegate does not answer, the app falls back to `localStorage`, then to memory for the session.
+An identity is an ed25519 key kept by the identity delegate in your node. It is created **on purpose**, on the Identity page (menu), with an artist name: nothing creates a key for people who only browse and listen, and publishing without one sends you there. Right after creating it the page asks you to download a backup.
+
+- **Export**: a file with the key, the artist name and your list of releases. With a passphrase it is encrypted (AES-GCM, key derived with PBKDF2); without one it is plain JSON, and anyone who has it can publish and edit as you.
+- **Import**: restores an identity from a backup, on this node or a new one, together with the name and the release list. It replaces the current identity, so it asks for confirmation.
+- **Start over**: a new key. The old one is gone unless it was exported.
+
+The delegate is optional: if it does not answer, the app falls back to `localStorage`, then to memory, and the Identity page warns that the browser cannot keep the key. The identity otherwise belongs to your node; a backup is how you use it elsewhere.
 
 ## Measured limits
 
@@ -61,7 +67,7 @@ On a local dev node (no network latency):
 - Limits in the UI: 30 tracks and 250 MB per release, 60 MB per track.
 - No payments, downloads page, comments or artist profile pages.
 - **Removing a release does not erase its audio.** Chunks are content-addressed and immutable: they stay on the network while nodes host them, and anyone who already has their addresses can fetch them. Removal only deletes the references (the track list) from the release and the directory.
-- Editing and removing work from the node that published the release: the identity belongs to that node.
+- Editing and removing need the identity the release was published with: use it on the node where you created it, or import a backup elsewhere.
 - Releases published before editing existed (an older release contract) cannot be edited or removed: the node refuses any update to them and the client only sees a timeout. The release page says so instead of offering the buttons; publish the release again to get an editable one.
 - The blocklist only hides a release from the directory. It cannot remove it from Freenet.
 
