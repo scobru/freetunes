@@ -26,7 +26,7 @@ const ICON_CHAT = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2.5h1
 const ICON_FLAG = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h1.5V15H3zM5 2h8l-2 3 2 3H5z"/></svg>`;
 const ICON_PAUSE = `<svg class="pause-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h3.5v13H3zM9.5 1.5H13v13H9.5z"/></svg>`;
 
-// route: #/ explore | #/publish | #/identity | #/r/<id>.<params> | #/edit/<id>.<params> | #/admin (not linked anywhere)
+// route: #/ explore | #/publish | #/identity | #/r/<id>.<params> | #/edit/<id>.<params> | #/a/<owner key> artist | #/admin (not linked anywhere)
 function route() {
   // inside the Freenet container, keep the address bar in sync so the URL is shareable
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
@@ -39,6 +39,8 @@ function route() {
   if (h === "#/publish") return publishPage();
   if (h === "#/identity") return identityPage();
   if (h === "#/admin") return admin();
+  const ar = h.match(/^#\/a\/([0-9a-f]{64})$/);
+  if (ar) return artistPage(ar[1]);
   const m = h.match(/^#\/(r|edit)\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96})$/);
   if (m?.[1] === "edit") return editPage(m[2], m[3]);
   return m ? releasePage(m[2], m[3]) : explore();
@@ -104,6 +106,31 @@ async function explore() {
   } catch (e) { $("#list").innerHTML = `<p class="err">Could not load the directory: ${esc(String(e))}</p>`; }
 }
 
+// ---------------- artist page: the directory entries signed by one key ----------------
+async function artistPage(pk: string) {
+  app.innerHTML = `<p class="muted">Loading... (the first visit on a node can take up to 30 s)</p>`;
+  try {
+    const [dir, me] = await Promise.all([loadDirectory(), peekIdentity()]);
+    const rows = Object.entries(dir.entries).filter(([, e]) => e.params.slice(0, 64) === pk && !e.removed).sort(([, a], [, b]) => b.ts - a.ts);
+    const yours = me?.pk === pk;
+    // your own releases that are not in the directory (private links) show up on your page too
+    const listed = new Set(rows.map(([id]) => id));
+    const unlisted = yours ? (await myReleases()).filter((r) => !listed.has(idOfHash(r.hash))) : [];
+    const name = rows[0]?.[1].artist ?? unlisted[0]?.artist ?? "Unknown artist";
+    app.innerHTML = `
+      <p><a href="#/">← All releases</a></p>
+      <p class="eyebrow">Artist</p>
+      <h1>${esc(name)}</h1>
+      <div class="chips"><span class="chip">${rows.length + unlisted.length} release${rows.length + unlisted.length === 1 ? "" : "s"}</span>
+        <span class="chip" title="${esc(pk)}">key ${esc(pk.slice(0, 8))}…</span>${yours ? `<span class="chip hot">you</span>` : ""}</div>
+      ${rows.length + unlisted.length ? `<div class="grid">${rows.map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover, ` · ${new Date(e.ts).toLocaleDateString()}`)).join("")}${unlisted.map((r) => card(r.hash, idOfHash(r.hash), r.title, r.artist, r.cover, " · not listed")).join("")}</div>`
+        : `<div class="empty">No releases listed in the directory for this artist.</div>`}
+      <label class="field share"><span>Link to share</span><input readonly value="${esc(pageUrl(`#/a/${pk}`))}" onfocus="this.select()" /></label>
+      <p class="notice">Only releases listed in the public directory appear here. The page is identified by the artist's key, not by the name.</p>`;
+    lazyCovers(app);
+  } catch (e) { app.innerHTML = `<p class="err">Could not load the artist: ${esc(String(e))}</p>`; }
+}
+
 // ---------------- publish / edit ----------------
 type Item = { kind: "old"; title: string; chunks: ChunkRef[]; size: number } | { kind: "new"; title: string; file: File };
 const sizeOf = (it: Item) => (it.kind === "old" ? it.size : it.file.size);
@@ -139,6 +166,8 @@ function releaseForm(existing?: Release) {
         <label class="field"><span>Artist</span><input id="artist" placeholder="Artist name" maxlength="80" value="${esc(m?.artist ?? "")}" /></label>
         <label class="field"><span>Title</span><input id="title" placeholder="Release title" maxlength="120" value="${esc(m?.title ?? "")}" /></label>
       </div>
+      <label class="field"><span>About this release (optional)</span>
+        <textarea id="about" rows="4" maxlength="2000" placeholder="Credits, recording notes, where to find more, licence details...">${esc(m?.about ?? "")}</textarea></label>
       <label class="field"><span>Licence</span>
         <select id="license">${Object.entries(LICENSES).map(([k, v]) => `<option value="${k}" ${k === (m?.license ?? "own") ? "selected" : ""}>${esc(v)}</option>`).join("")}</select></label>
     </div>
@@ -248,7 +277,7 @@ function releaseForm(existing?: Release) {
         tracks.push({ title: it.title.trim(), chunks });
       }
       await flushKnown();
-      const meta = { title, artist, license, rights: true, cover, tracks, persona: (await currentLink()) ?? undefined, comments: m?.comments };
+      const meta = { title, artist, license, rights: true, cover, tracks, persona: (await currentLink()) ?? undefined, comments: m?.comments, about: $<HTMLTextAreaElement>("#about").value.trim().slice(0, 2000) || undefined };
       msg.textContent = edit ? "Saving..." : "Publishing the release...";
       let instance: string, params: string;
       if (existing) {
@@ -293,7 +322,7 @@ async function releasePage(instance: string, params: string) {
       <div>
         <p class="eyebrow">Release</p>
         <h1>${esc(m.title)}</h1>
-        <p class="by">by <b>${esc(m.artist)}</b></p>
+        <p class="by">by <a href="#/a/${esc(params.slice(0, 64))}"><b>${esc(m.artist)}</b></a></p>
         <div class="chips">
           <span class="chip hot">${esc(LICENSES[m.license] ?? m.license)}</span>
           <span class="chip">${m.tracks.length} track${m.tracks.length === 1 ? "" : "s"}</span>
@@ -303,6 +332,7 @@ async function releasePage(instance: string, params: string) {
         <div id="owner" class="owner-tools"></div>
       </div>
     </section>
+    ${m.about ? `<div class="card about"><h2>About</h2><p>${esc(m.about)}</p></div>` : ""}
     <div id="changed" class="notice" hidden>The artist updated this release. <a href="#" id="refresh">Refresh</a></div>
     <div class="card player"><audio id="player" controls preload="none"></audio><p id="status" class="muted"></p></div>
     <ol class="tracks">${m.tracks.map((t, i) => `

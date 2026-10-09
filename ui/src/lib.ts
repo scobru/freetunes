@@ -56,6 +56,8 @@ export interface ReleaseMeta {
   persona?: WhoiamLink;
   /** Address of the release's comments contract. Absent on releases published before comments existed. */
   comments?: string;
+  /** Free text about the release (credits, notes, links), shown on the release page. */
+  about?: string;
 }
 export interface Comment { a: string; name: string; track: number; ts: number; text: string; nonce: number; sig: string }
 export interface Removal { by: string; ts: number; nonce: number; sig: string }

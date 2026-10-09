@@ -13,6 +13,8 @@ An artist publishes a release (cover, title, licence, MP3 tracks) and anyone can
 - **Remove**: the artist can take a release down. It disappears from FreeTunes and from the directory, and the contract is replaced by a signed notice. **This does not erase the audio** (see below).
 - **Stream**: a release page with the cover, track list and a player. Playback starts after the first chunk arrives instead of waiting for the whole file, and you can seek once the track is buffered.
 - **Explore**: the public directory, newest first.
+- **Artist page** (`#/a/<key>`): the releases an artist key has listed in the directory (plus, for you, your unlisted ones), linked from every release page.
+- **About box**: an optional free-text description (credits, notes, links) on each release, edited with the rest of the release.
 - **Comment**: people with an identity can comment on each track; everyone can read.
 - **Report**: anyone can report a release or a track (for example one that may infringe copyright). Reports are public, rate-limited with [ante](https://github.com/soudasuwa/ante) proofs of work, and reach the moderator's queue.
 

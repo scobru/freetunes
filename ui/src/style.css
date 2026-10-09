@@ -165,3 +165,5 @@ button.link:hover:not(:disabled) { color: var(--danger); }
 .rep { padding: 8px 0; border-bottom: 1px solid var(--line); }
 .rep p { margin: 4px 0; overflow-wrap: anywhere; }
 @media (max-width: 640px) { .cpanel, .rpanel { padding-left: 0; } }
+
+.about p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
