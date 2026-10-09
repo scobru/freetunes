@@ -62,6 +62,7 @@ On a local dev node (no network latency):
 - No payments, downloads page, comments or artist profile pages.
 - **Removing a release does not erase its audio.** Chunks are content-addressed and immutable: they stay on the network while nodes host them, and anyone who already has their addresses can fetch them. Removal only deletes the references (the track list) from the release and the directory.
 - Editing and removing work from the node that published the release: the identity belongs to that node.
+- Releases published before editing existed (an older release contract) cannot be edited or removed: the node refuses any update to them and the client only sees a timeout. The release page says so instead of offering the buttons; publish the release again to get an editable one.
 - The blocklist only hides a release from the directory. It cannot remove it from Freenet.
 
 ## Development

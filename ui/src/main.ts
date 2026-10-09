@@ -109,6 +109,7 @@ async function editPage(instance: string, params: string) {
     const me = await identity();
     if (me.pk !== params.slice(0, 64)) return void (app.innerHTML = `<div class="gone"><h1>Not your release</h1><p class="muted">Only the artist who published it can edit it, from the node where they published.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
     if (rel.meta.deleted) return void (app.innerHTML = `<div class="gone"><h1>Release removed</h1><a class="btn" href="#/">Back</a></div>`);
+    if (rel.legacy) return void (app.innerHTML = `<div class="gone"><h1>Cannot edit this release</h1><p class="muted">It was published with an older version of FreeTunes, before editing existed. Publish it again to get a release you can edit.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
     return releaseForm(rel);
   } catch (e) { app.innerHTML = `<p class="err">Could not load the release: ${esc(String(e))}</p>`; }
 }
@@ -332,6 +333,10 @@ async function releasePage(instance: string, params: string) {
   // owner tools: only the artist's own key matches the first 32 bytes of the contract parameters
   void identity().then((me) => {
     if (me.pk !== params.slice(0, 64)) return;
+    if (rel.legacy) { // the node would refuse every change, so do not offer them
+      $("#owner").innerHTML = `<p class="muted"><small>Published with an older version of FreeTunes: it cannot be edited or removed. Publish it again for a release you can edit.</small></p>`;
+      return;
+    }
     $("#owner").innerHTML = `<a class="btn" href="#/edit/${esc(instance)}.${esc(params)}">Edit release</a><button id="del" class="danger" type="button">Remove release</button>`;
     $("#del").onclick = () => confirmRemoval(rel);
   });

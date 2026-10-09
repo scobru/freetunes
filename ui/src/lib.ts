@@ -286,7 +286,11 @@ export async function getChunk(addr: string): Promise<Uint8Array> {
 }
 
 // ---------------------------------------------------------------- releases
-export interface Release { instance: string; params: string; meta: ReleaseMeta }
+export interface Release {
+  instance: string; params: string; meta: ReleaseMeta;
+  /** Published with an older release contract (before editing existed). The node refuses any change to it. */
+  legacy: boolean;
+}
 
 /** Publish a release. Parameters = owner pubkey || random salt, so one artist can publish any number of releases. */
 export async function publishRelease(meta: Omit<ReleaseMeta, "ts">) {
@@ -301,7 +305,10 @@ export async function publishRelease(meta: Omit<ReleaseMeta, "ts">) {
 export async function loadRelease(instance: string, params: string): Promise<Release> {
   const s = await getJson<{ meta_json: string; sig: string }>(instance);
   const blank: ReleaseMeta = { title: "", artist: "", license: "own", rights: false, tracks: [], ts: 0 };
-  return { instance, params, meta: { ...blank, ...JSON.parse(s.meta_json) } as ReleaseMeta };
+  // the key learned from the node carries the code hash the release was published with
+  const have = keys.get(instance)?.codePart(), now = (await codeOf(releaseWasm)).codeHash;
+  const legacy = !!have && hex(have) !== hex(now);
+  return { instance, params, legacy, meta: { ...blank, ...JSON.parse(s.meta_json) } as ReleaseMeta };
 }
 
 /** Sign a new state and send it to the release contract. A newer timestamp wins, so it must beat the current one. */
@@ -309,7 +316,12 @@ async function pushState(instance: string, params: string, meta: object, current
   const me = await identity(); // must be the release owner
   const meta_json = JSON.stringify({ ...meta, ts: Math.max(Date.now(), current + 1) });
   const sig = await me.sign(`ftr1|${params}|${meta_json}`);
-  await retrying(() => sendDelta(instance, { meta_json, sig }));
+  try { await retrying(() => sendDelta(instance, { meta_json, sig })); }
+  catch (e) {
+    // a refused update is never answered: the client only sees a timeout
+    if (!/timeout/i.test(String(e))) throw e;
+    throw new Error("The node did not accept the change. Releases published with an older version of FreeTunes cannot be edited or removed; otherwise check your connection and try again.");
+  }
 }
 
 /** Owner only: replace the release with an edited version. `current` is the timestamp of the version being edited. */
