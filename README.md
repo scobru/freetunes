@@ -36,10 +36,18 @@ Tracks are split at MP3 frame boundaries into chunks of about 512 KB, so every c
 An identity is an ed25519 key kept by the identity delegate in your node. It is created **on purpose**, on the Identity page (menu), with an artist name: nothing creates a key for people who only browse and listen, and publishing without one sends you there. Right after creating it the page asks you to download a backup.
 
 - **Export**: a file with the key, the artist name and your list of releases. With a passphrase it is encrypted (AES-GCM, key derived with PBKDF2); without one it is plain JSON, and anyone who has it can publish and edit as you.
-- **Import**: paste text into the box, or pick a file that fills it. It replaces the current identity, so it asks for confirmation. Two kinds of text are recognised:
-  - a **FreeTunes backup** (restores the key, the artist name and your release list, on this node or a new one);
-  - a **[whoiam](https://github.com/skandragon/freenet-whoiam) master seed**: the whole backup text or just its 64-character hex. whoiam derives persona `i` as `blake3.derive_key("whoiam identity v1", seed || i as 4 bytes little-endian)`; FreeTunes lists the first eight personas by public key (the one whoiam shows) and imports only the one you pick, never the master seed. The same key then identifies you in both apps. The 24-word recovery phrase alone is not supported yet: use the hex that sits next to it in the backup file. A pasted 64-hex value can also be used directly as the key.
+- **Import**: paste the text of a FreeTunes backup into the box, or pick the file. It restores the key, the artist name and your release list, on this node or a new one. It replaces the current identity, so it asks for confirmation.
 - **Start over**: a new key. The old one is gone unless it was exported.
+
+### Linking a whoiam persona
+
+[whoiam](https://github.com/skandragon/freenet-whoiam) keeps personas derived from one master seed. FreeTunes never asks for that seed or for a persona's key. It uses whoiam's own "sign in with whoiam" flow instead:
+
+1. On the Identity page you give the address of your whoiam site on this node and press **Link a whoiam persona**. FreeTunes remembers a one-time challenge (`<nonce>.<your FreeTunes public key>`) in the delegate store and opens whoiam with `?connect=v1&challenge=...&return=<FreeTunes address>`.
+2. whoiam asks which persona to share and signs `"whoiam-connect-v1" || pk || len || return address || len || challenge || ts` with that persona's key, then brings you back.
+3. FreeTunes checks the challenge (one use), that the time is within 10 minutes, and the ed25519 signature. The challenge contains your FreeTunes key, so the persona is vouching for exactly this key.
+
+The proof is kept with the identity and added to the release metadata you publish. Anyone viewing a release verifies it themselves and, if it holds for the artist's key, shows a "whoiam ✓" badge with the persona's public key; the contract ignores the field. Replacing the identity invalidates the link, and unlinking removes it. The signature format is checked against whoiam's golden test vector (`npm test` in `ui/`).
 
 The delegate is optional: if it does not answer, the app falls back to `localStorage`, then to memory, and the Identity page warns that the browser cannot keep the key. The identity otherwise belongs to your node; a backup is how you use it elsewhere.
 

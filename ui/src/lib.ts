@@ -12,6 +12,8 @@ import {
   DelegateRequestType, DelegateType, InboundDelegateMsgT, InboundDelegateMsgType, RegisterDelegateT,
   RelatedContractsT, WasmDelegateV1T,
 } from "@freenetorg/freenet-stdlib/client-request";
+import { personaName, verifyProof } from "./whoiam";
+export { personaName };
 import chunkWasm from "./chunk.wasm?url";
 import releaseWasm from "./release.wasm?url";
 import directoryWasm from "./directory.wasm?url";
@@ -31,11 +33,21 @@ export const LICENSES: Record<string, string> = {
 };
 export interface ChunkRef { a: string; ms: number; n: number } // address, duration, size
 export interface TrackMeta { title: string; chunks: ChunkRef[] }
+/** A whoiam persona vouching for this identity key (see the "sign in with whoiam" flow). */
+export interface WhoiamLink {
+  pk: string; sig: string; ts: number;
+  /** `<nonce>.<hex of the FreeTunes identity key>`: the persona signed this exact string. */
+  challenge: string;
+  /** Origin and path of FreeTunes when the proof was made; the signature binds to it. */
+  base: string;
+}
 export interface ReleaseMeta {
   title: string; artist: string; license: string; rights: boolean;
   cover?: { addr: string; n: number }; tracks: TrackMeta[]; ts: number;
   /** The artist took the release down (a tombstone: no title, no tracks). */
   deleted?: boolean;
+  /** Optional: a whoiam persona that vouches for the artist's key. Viewers verify it; the contract ignores it. */
+  persona?: WhoiamLink;
 }
 export interface DirEntry {
   params: string; title: string; artist: string; cover?: string; removed?: boolean; ts: number; nonce: number; sig: string;
@@ -317,45 +329,52 @@ export async function replaceIdentity(sk?: string): Promise<Identity> {
   return asIdentity(s, await s.replace(sk ?? newSecret()));
 }
 
-// ---- importing from a pasted text: a FreeTunes backup, or a whoiam master seed ----
-const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-/** Base58 (Bitcoin alphabet), the way whoiam and Freenet show public keys. */
-export function toBase58(b: Uint8Array): string {
-  const d: number[] = [];
-  for (const byte of b) {
-    let carry = byte;
-    for (let i = 0; i < d.length; i++) { carry += d[i] << 8; d[i] = carry % 58; carry = (carry / 58) | 0; }
-    while (carry) { d.push(carry % 58); carry = (carry / 58) | 0; }
+// ---- whoiam: link a persona without ever receiving a secret ("sign in with whoiam") ----
+/** Does this proof hold, and is it about `identityPk` (the key it was made for)? */
+export const verifyLink = async (l: WhoiamLink, identityPk: string) =>
+  l.challenge.endsWith(`.${identityPk}`) && (await verifyProof(l));
+
+const LINK_MAX_AGE_MS = 10 * 60 * 1000;
+/** Our own address without query or hash: whoiam binds its proof to it. */
+export const linkBase = () => `${location.protocol}//${location.host}${location.pathname}`;
+
+/** Where to send the user to pick a persona. Remembers the one-time challenge in the delegate store. */
+export async function startLink(whoiamUrl: string): Promise<string> {
+  const me = await requireIdentity();
+  const u = new URL(whoiamUrl);
+  if (u.host !== location.host || !/^\/v[12]\/contract\/web\/[^/]+\/?$/.test(u.pathname)) {
+    throw new Error("Paste the address of your whoiam site on this node (it starts with the same host as this page).");
   }
-  let out = "";
-  for (const byte of b) { if (byte) break; out += "1"; }
-  return out + d.reverse().map((x) => B58[x]).join("");
+  const challenge = `${hex(crypto.getRandomValues(new Uint8Array(16)))}.${me.pk}`;
+  await storePut("link-pending", JSON.stringify({ challenge, base: linkBase(), at: Date.now() }));
+  await storePut("whoiam-url", u.origin + u.pathname);
+  return `${u.origin}${u.pathname}?connect=v1&challenge=${challenge}&return=${encodeURIComponent(linkBase())}`;
 }
 
-export interface Candidate { label: string; sk: string; pk: string }
-
-/** The first 64 hex characters standing alone in a text (a whoiam backup file has them under "hex:"). */
-export function findSeed(text: string): string | null {
-  return text.match(/(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/)?.[0].toLowerCase() ?? null;
+/** Handle whoiam's callback: check the challenge, freshness and signature, then keep the link. */
+export async function finishLink(q: URLSearchParams): Promise<WhoiamLink> {
+  if (q.get("whoiam") === "denied") throw new Error("You chose not to share a persona.");
+  const pending = JSON.parse((await storeGet("link-pending")) || "null") as { challenge: string; base: string } | null;
+  await storePut("link-pending", ""); // one use: burn it whatever happens next
+  const l: WhoiamLink = { pk: q.get("pk") ?? "", sig: q.get("sig") ?? "", challenge: q.get("challenge") ?? "", ts: Number(q.get("ts")), base: pending?.base ?? "" };
+  if (!pending || l.challenge !== pending.challenge) throw new Error("This link request is unknown or was already used. Start again from the Identity page.");
+  if (!Number.isFinite(l.ts) || Math.abs(Date.now() - l.ts) > LINK_MAX_AGE_MS) throw new Error("The proof is too old or its clock is off. Start again.");
+  const me = await requireIdentity();
+  if (!(await verifyLink(l, me.pk))) throw new Error("The proof does not verify for this identity.");
+  await storePut("whoiam-link", JSON.stringify(l));
+  return l;
 }
 
-/**
- * The keys a 64-hex value can stand for: itself as a raw key, and the first `count` personas of a whoiam master seed.
- * whoiam derives persona i as blake3.derive_key("whoiam identity v1", seed || i as 4 bytes little-endian);
- * the public key is what whoiam shows for that persona, so the user can pick the right one. Only the chosen
- * persona's key is imported, never the master seed.
- */
-export async function candidatesFor(hexValue: string, count = 8): Promise<Candidate[]> {
-  const seed = unhex(hexValue), ctx = enc.encode("whoiam identity v1");
-  const make = async (label: string, sk: Uint8Array): Promise<Candidate> => ({ label, sk: hex(sk), pk: toBase58(await ed.getPublicKeyAsync(sk)) });
-  const personas = Array.from({ length: count }, (_, i) => {
-    const ikm = new Uint8Array(36);
-    ikm.set(seed);
-    new DataView(ikm.buffer).setUint32(32, i, true);
-    return make(`whoiam persona #${i + 1}`, blake3(ikm, { context: ctx }));
-  });
-  return [...(await Promise.all(personas)), await make("Use the value itself as the key", seed)];
+/** The stored link, only if it still verifies for the current identity (a replaced identity invalidates it). */
+export async function currentLink(): Promise<WhoiamLink | null> {
+  try {
+    const me = await peekIdentity(), raw = await storeGet("whoiam-link");
+    if (!me || !raw) return null;
+    const l = JSON.parse(raw) as WhoiamLink;
+    return (await verifyLink(l, me.pk)) ? l : null;
+  } catch { return null; }
 }
+export const clearLink = () => storePut("whoiam-link", "");
 
 // small per-app store (artist name, my releases): the delegate when available, else localStorage, else memory
 const mem = new Map<string, string>();

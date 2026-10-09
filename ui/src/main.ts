@@ -1,9 +1,9 @@
 import "./style.css";
 import {
-  backupIsEncrypted, blockReleases, candidatesFor, createIdentity, deleteRelease, findSeed, flushKnown, fmtTime, getChunk, LICENSES, listRelease,
-  loadDirectory, loadRelease, makeBackup, makeCover, onRemoteChange, peekIdentity, publishRelease, putChunk, readBackup,
-  replaceIdentity, restoreBackup, splitMp3, storeGet, storePut, Streamer, updateRelease, watchRelease,
-  type Candidate, type ChunkRef, type Identity, type Mp3Piece, type Release, type TrackMeta,
+  backupIsEncrypted, blockReleases, clearLink, createIdentity, currentLink, deleteRelease, finishLink, flushKnown, fmtTime, getChunk,
+  LICENSES, listRelease, loadDirectory, loadRelease, makeBackup, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
+  putChunk, readBackup, replaceIdentity, restoreBackup, splitMp3, startLink, storeGet, storePut, Streamer, updateRelease,
+  verifyLink, watchRelease, type ChunkRef, type Identity, type Mp3Piece, type Release, type TrackMeta,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -29,6 +29,8 @@ function route() {
   // inside the Freenet container, keep the address bar in sync so the URL is shareable
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
   const h = location.hash;
+  const q = new URLSearchParams(location.search);
+  if (q.has("whoiam")) return linkCallback(q);
   const here = h === "#/publish" ? "publish" : h === "#/identity" ? "identity" : h === "" || h === "#/" ? "explore" : "";
   document.querySelectorAll<HTMLElement>("[data-nav]").forEach((a) => a.toggleAttribute("aria-current", a.dataset.nav === here));
   window.scrollTo(0, 0);
@@ -244,7 +246,7 @@ function releaseForm(existing?: Release) {
         tracks.push({ title: it.title.trim(), chunks });
       }
       await flushKnown();
-      const meta = { title, artist, license, rights: true, cover, tracks };
+      const meta = { title, artist, license, rights: true, cover, tracks, persona: (await currentLink()) ?? undefined };
       msg.textContent = edit ? "Saving..." : "Publishing the release...";
       let instance: string, params: string;
       if (existing) {
@@ -333,6 +335,12 @@ async function releasePage(instance: string, params: string) {
   $("#refresh").onclick = (e) => { e.preventDefault(); void releasePage(instance, params); };
 
   // owner tools: only the artist's own key matches the first 32 bytes of the contract parameters
+  if (m.persona) { // a whoiam persona vouches for the artist's key: show it only if the proof holds
+    const p = m.persona;
+    void verifyLink(p, params.slice(0, 64)).then((ok) => {
+      if (ok) $(".chips").insertAdjacentHTML("beforeend", `<span class="chip hot" title="whoiam persona ${esc(personaName(p.pk))}">whoiam \u2713 ${esc(personaName(p.pk).slice(0, 8))}\u2026</span>`);
+    });
+  }
   void peekIdentity().then((me) => {
     if (me?.pk !== params.slice(0, 64)) return;
     if (rel.legacy) { // the node would refuse every change, so do not offer them
@@ -399,15 +407,14 @@ async function identityPage() {
     a.click();
   };
 
-  /** Import card shared by the "no identity" and "have identity" views: paste text, or pick a file that fills the box. */
+  /** Import card shared by the "no identity" and "have identity" views: paste a backup, or pick a file that fills the box. */
   const importCard = (replacing: boolean) => `
     <div class="card">
-      <h2>Import an identity</h2>
+      <h2>Import a backup</h2>
       <p class="muted">${replacing ? "This <b>replaces</b> your current identity. You will lose control of the releases made with it unless you exported it first." : "Restore an identity on this node or a new one."}
-        Paste a FreeTunes backup or a <b>whoiam master seed</b> (its backup text, or just the 64-character hex).</p>
-      <textarea id="bpaste" rows="4" spellcheck="false" autocomplete="off" placeholder="Paste here"></textarea>
+        Paste the text of a FreeTunes backup, or choose the file.</p>
+      <textarea id="bpaste" rows="4" spellcheck="false" autocomplete="off" placeholder="Paste the backup here"></textarea>
       <label class="drop small" id="bdrop"><input id="bfile" type="file" accept=".json,.txt,application/json,text/plain" />or choose a file</label>
-      <div id="bchoices" class="choices" hidden></div>
       <label class="field" id="bpass-row" hidden><span>Passphrase</span><input id="bpass" type="password" autocomplete="off" /></label>
       ${replacing ? `<label class="check"><input id="bsure" type="checkbox" />I understand that this replaces my current identity.</label>` : ""}
       <div class="actions"><button id="bgo" type="button" disabled>Import</button><span id="bmsg" class="muted"></span></div>
@@ -415,46 +422,29 @@ async function identityPage() {
 
   const wireImport = (replacing: boolean, after: () => void) => {
     const paste = $<HTMLTextAreaElement>("#bpaste"), pass = $<HTMLInputElement>("#bpass"), go = $<HTMLButtonElement>("#bgo"), msg = $("#bmsg");
-    const sure = app.querySelector<HTMLInputElement>("#bsure"), choices = $("#bchoices");
-    let kind: "backup" | "keys" | null = null; // what the pasted text turned out to be
-    const ready = () => (go.disabled = !(kind === "backup" || (kind === "keys" && !!choices.querySelector("input:checked"))) || (replacing && !sure?.checked));
-
-    const analyze = async () => {
+    const sure = app.querySelector<HTMLInputElement>("#bsure");
+    let valid = false;
+    const ready = () => (go.disabled = !valid || (replacing && !sure?.checked));
+    const analyze = () => {
       const text = paste.value.trim();
-      kind = null; choices.hidden = true; choices.innerHTML = ""; $("#bpass-row").hidden = true; msg.textContent = "";
+      valid = false; $("#bpass-row").hidden = true; msg.textContent = "";
       if (text) {
-        try {
-          if (text.startsWith("{")) { $("#bpass-row").hidden = !backupIsEncrypted(text); kind = "backup"; }
-          else {
-            const seed = findSeed(text);
-            if (!seed) throw new Error("Not recognised: paste a FreeTunes backup or a whoiam master seed.");
-            const cands = await candidatesFor(seed);
-            choices.innerHTML = `<p class="muted"><small>Pick the persona whose public key matches the one whoiam shows. Only that key is imported, never the master seed.</small></p>` +
-              cands.map((c, k) => `<label class="check"><input type="radio" name="cand" value="${k}" /><span><b>${esc(c.label)}</b><br /><code>${esc(c.pk)}</code></span></label>`).join("");
-            choices.hidden = false;
-            choices.querySelectorAll("input").forEach((r) => (r.onchange = ready));
-            (choices as HTMLElement & { cands?: typeof cands }).cands = cands;
-            kind = "keys";
-          }
-        } catch (e) { msg.textContent = String((e as Error).message ?? e); }
+        try { $("#bpass-row").hidden = !backupIsEncrypted(text); valid = true; }
+        catch { msg.textContent = "Not recognised: paste a FreeTunes backup. To use a whoiam persona, link it below instead of pasting its seed."; }
       }
       ready();
     };
-    paste.oninput = () => void analyze();
+    paste.oninput = analyze;
     $<HTMLInputElement>("#bfile").onchange = async (e) => {
       const f = (e.target as HTMLInputElement).files?.[0];
-      if (f) { paste.value = await f.text(); await analyze(); }
+      if (f) { paste.value = await f.text(); analyze(); }
     };
     if (sure) sure.onchange = ready;
     go.onclick = async () => {
       go.disabled = true;
       try {
         msg.textContent = "Importing...";
-        if (kind === "backup") await restoreBackup(await readBackup(paste.value.trim(), pass.value));
-        else {
-          const cands = (choices as HTMLElement & { cands?: Candidate[] }).cands!;
-          await replaceIdentity(cands[+choices.querySelector<HTMLInputElement>("input:checked")!.value].sk);
-        }
+        await restoreBackup(await readBackup(paste.value.trim(), pass.value));
         paste.value = "";
         after();
       } catch (e) { msg.textContent = String((e as Error).message ?? e); ready(); }
@@ -504,6 +494,7 @@ async function identityPage() {
         <label class="field"><span>Passphrase (optional)</span><input id="epass" type="password" autocomplete="off" /></label>
         <div class="actions"><button id="export" class="primary" type="button">Download backup</button><span id="emsg" class="muted"></span></div>
       </div>
+      <div class="card" id="whoiam-card"><h2>whoiam</h2><p class="muted">Loading...</p></div>
       ${importCard(true)}
       <div class="card">
         <h2>Start over</h2>
@@ -511,6 +502,7 @@ async function identityPage() {
         <label class="check"><input id="osure" type="checkbox" />I understand that this replaces my current identity.</label>
         <div class="actions"><button id="fresh" class="danger" type="button" disabled>Create a new identity</button></div>
       </div>`;
+    void drawWhoiam(me);
     $("#savename").onclick = async () => { await storePut("artist", $<HTMLInputElement>("#name").value.trim()); $("#nmsg").textContent = "Saved."; };
     $("#export").onclick = async () => {
       try {
@@ -524,6 +516,48 @@ async function identityPage() {
     $("#fresh").onclick = async () => { await replaceIdentity(); await draw(true); };
   };
   await draw();
+}
+
+/** Open another page of this node (or any URL outside the sandbox) the way the Freenet shell allows. */
+const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
+
+/** Link a whoiam persona to this identity: whoiam signs a proof, FreeTunes never receives any secret. */
+async function drawWhoiam(me: Identity) {
+  const card = $("#whoiam-card");
+  const link = await currentLink();
+  if (link) {
+    card.innerHTML = `<h2>whoiam</h2>
+      <p>Linked to the whoiam persona <code>${esc(personaName(link.pk))}</code> <span class="muted">since ${new Date(link.ts).toLocaleDateString()}</span></p>
+      <p class="muted"><small>Your releases show a whoiam badge. whoiam signed that it knows this FreeTunes key; it never gave FreeTunes any key.</small></p>
+      <div class="actions"><button id="unlink" type="button">Unlink</button></div>`;
+    $("#unlink").onclick = async () => { await clearLink(); await drawWhoiam(me); };
+    return;
+  }
+  const saved = (await storeGet("whoiam-url")) ?? "";
+  card.innerHTML = `<h2>whoiam</h2>
+    <p class="muted">Prove that one of your <b>whoiam</b> personas stands behind this identity, without sharing any key or seed. whoiam opens, you choose a persona, and you come back here.</p>
+    <label class="field"><span>Address of your whoiam site</span><input id="wurl" value="${esc(saved)}" placeholder="${esc(`${location.protocol}//${location.host}/v1/contract/web/\u2026/`)}" spellcheck="false" /></label>
+    <div class="actions"><button id="wgo" class="primary" type="button">Link a whoiam persona</button><span id="wmsg" class="muted"></span></div>`;
+  $("#wgo").onclick = async () => {
+    try {
+      $("#wmsg").textContent = "Opening whoiam...";
+      goTo(await startLink($<HTMLInputElement>("#wurl").value.trim()));
+    } catch (e) { $("#wmsg").textContent = String((e as Error).message ?? e); }
+  };
+}
+
+/** whoiam sent the user back here with its proof (or a refusal). */
+async function linkCallback(q: URLSearchParams) {
+  app.innerHTML = `<h1>whoiam</h1><p class="muted">Checking the proof...</p>`;
+  let html: string;
+  try {
+    const l = await finishLink(q);
+    html = `<div class="notice"><b>Linked.</b> The whoiam persona <code>${esc(personaName(l.pk))}</code> now stands behind this identity.</div>`;
+  } catch (e) {
+    html = `<div class="notice"><b>Not linked.</b> ${esc(String((e as Error).message ?? e))}</div>`;
+  }
+  history.replaceState(null, "", location.pathname + "#/identity"); // the query must not run twice
+  app.innerHTML = `<h1>whoiam</h1>${html}<div class="actions"><a class="btn primary" href="#/identity">Back to Identity</a></div>`;
 }
 
 // ---------------- admin: hide releases from the directory with the admin key (hash #/admin) ----------------
