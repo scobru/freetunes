@@ -39,31 +39,21 @@ export const LICENSES: Record<string, string> = {
 };
 export interface ChunkRef { a: string; ms: number; n: number } // address, duration, size
 export interface TrackMeta { title: string; chunks: ChunkRef[] }
-/** A whoiam persona vouching for this identity key (see the "sign in with whoiam" flow). */
-export interface WhoiamLink {
-  pk: string; sig: string; ts: number;
-  /** `<nonce>.<hex of the FreeTunes identity key>`: the persona signed this exact string. */
-  challenge: string;
-  /** Origin and path of FreeTunes when the proof was made; the signature binds to it. */
-  base: string;
-}
 export interface ReleaseMeta {
   title: string; artist: string; license: string; rights: boolean;
   cover?: { addr: string; n: number }; tracks: TrackMeta[]; ts: number;
   /** The artist took the release down (a tombstone: no title, no tracks). */
   deleted?: boolean;
-  /** Optional: a whoiam persona that vouches for the artist's key. Viewers verify it; the contract ignores it. */
-  persona?: WhoiamLink;
   /** Address of the release's comments contract. Absent on releases published before comments existed. */
   comments?: string;
   /** Free text about the release (credits, notes, links), shown on the release page. */
   about?: string;
 }
-export interface Comment { a: string; name: string; track: number; ts: number; text: string; nonce: number; sig: string }
-export interface Removal { by: string; ts: number; nonce: number; sig: string }
+export interface Comment { a: string; name: string; track: number; ts: number; text: string; nonce: number; sig: string; cert: Cert }
+export interface Removal { by: string; ts: number; nonce: number; sig: string; cert: Cert }
 export interface CommentsState { items: Record<string, Comment>; removed: Record<string, Removal> }
 export interface DirEntry {
-  params: string; title: string; artist: string; cover?: string; removed?: boolean; ts: number; nonce: number; sig: string;
+  params: string; title: string; artist: string; cover?: string; removed?: boolean; ts: number; nonce: number; sig: string; cert: Cert;
 }
 export interface DirState { entries: Record<string, DirEntry>; blocked: { ts: number; list: string[]; sig: string } }
 
@@ -166,7 +156,10 @@ async function sendDelta(instance: string, delta: object) {
 // ---------------------------------------------------------------- identity delegate
 // The signing key lives in the node (one per calling web app), so it survives sessions even inside the sandboxed
 // container where the page has no storage. If the delegate is missing or silent, fall back to localStorage, then memory.
-export interface Identity { pk: string; persisted: boolean; sign: (msg: string) => Promise<string> }
+/** A whoiam delegation: the persona's signature over `wd1.<app key>.<nonce>` for this app's address. */
+export interface Cert { base: string; challenge: string; ts: number; sig: string }
+/** `pk` is the whoiam persona; `sign` uses the app key it delegated, and `cert` is that delegation. */
+export interface Identity { pk: string; cert: Cert; persisted: boolean; sign: (msg: string) => Promise<string> }
 
 let delegateKey: DelegateKeyT | undefined;
 let delegateChain: Promise<unknown> = Promise.resolve();
@@ -236,13 +229,11 @@ const hasDelegate = () =>
     return false;
   }));
 
-/** Where the signing key lives. Creating an identity is always an explicit step: nothing here makes one by itself. */
+/** Where the app key lives. It is disposable: whoiam delegates it, and a lost one is replaced by signing in again. */
 interface KeyStore {
   persisted: boolean;
-  pk(): Promise<string | null>; // null when there is no identity yet
+  pk(): Promise<string | null>;
   create(sk: string): Promise<string>; // keeps the existing one, if any
-  replace(sk: string): Promise<string>;
-  exportSk(): Promise<string>;
   sign(msg: string): Promise<string>;
 }
 
@@ -253,8 +244,6 @@ const delegateStore: KeyStore = {
     catch (e) { if (/no identity/.test(String(e))) return null; throw e; }
   },
   create: async (sk) => (await callDelegate({ op: "init", sk })).pk,
-  replace: async (sk) => (await callDelegate({ op: "replace", sk })).pk,
-  exportSk: async () => (await callDelegate({ op: "export" })).sk,
   sign: async (msg) => (await callDelegate({ op: "sign", msg })).sig,
 };
 
@@ -266,144 +255,72 @@ const localStore: KeyStore = {
   get persisted() { return lsWorks; },
   pk: async () => { const h = readKey(); return h ? hex(await ed.getPublicKeyAsync(unhex(h))) : null; },
   create: async (sk) => { if (!readKey()) writeKey(sk); return hex(await ed.getPublicKeyAsync(unhex(readKey()!))); },
-  replace: async (sk) => { writeKey(sk); return hex(await ed.getPublicKeyAsync(unhex(sk))); },
-  exportSk: async () => { const h = readKey(); if (!h) throw new Error("no identity"); return h; },
   sign: async (msg) => hex(await ed.signAsync(enc.encode(msg), unhex(readKey()!))),
 };
 
 const keyStore = async () => ((await hasDelegate()) ? delegateStore : localStore);
-const asIdentity = (s: KeyStore, pk: string): Identity => ({ pk, persisted: s.persisted, sign: (m) => s.sign(m) });
-const newSecret = () => hex(ed.utils.randomPrivateKey());
+/** The app key (hex), created on first use. */
+const appKey = async () => { const s = await keyStore(); return (await s.pk()) ?? s.create(hex(ed.utils.randomPrivateKey())); };
 
-/** The identity, if one exists. Never creates one: listeners and visitors do not need a key. */
+// ---- identity: a whoiam persona, through a delegated app key ----
+// whoiam signs `wd1.<app key>.<nonce>` for this app's address: "this app key may act for me in FreeTunes"
+// (whoiam-delegation, in the freenames repo). The persona owns releases and comments; the app key signs for it.
+
+/** The app's own path: delegations and release parameters are bound to it (in dev, "/"). */
+const APP_PATH = location.pathname;
+export const APP_PATH_HEX = hex(enc.encode(APP_PATH));
+
+/** The signed-in persona, if its delegation still holds for this node's app key. Never creates anything. */
 export async function peekIdentity(): Promise<Identity | null> {
-  const s = await keyStore(), pk = await s.pk();
-  return pk ? asIdentity(s, pk) : null;
+  const raw = await storeGet("session");
+  if (!raw) return null;
+  const { persona, cert } = JSON.parse(raw) as { persona: string; cert: Cert };
+  const s = await keyStore(), k = await s.pk();
+  if (!k || cert.challenge.split(".")[1] !== k) return null; // the app key changed: sign in again
+  return { pk: persona, cert, persisted: s.persisted, sign: (m) => s.sign(m) };
 }
 
-/** The identity, or an error telling the user to create one. For everything that signs. */
+/** The identity, or an error telling the user to sign in. For everything that signs. */
 export async function requireIdentity(): Promise<Identity> {
   const me = await peekIdentity();
-  if (!me) throw new Error("Create an identity first (Identity in the menu).");
+  if (!me) throw new Error("Sign in with whoiam first (Identity in the menu).");
   return me;
 }
 
-/** Create an identity with a fresh key. If one exists already it is kept. */
-export async function createIdentity(): Promise<Identity> {
-  const s = await keyStore();
-  return asIdentity(s, await s.create(newSecret()));
-}
-
-// ---- backup: a file with the key, the artist name and the list of your releases ----
-export interface Backup { app: "freetunes"; v: 1; sk: string; name: string; releases: unknown; created: number }
-
-async function aesKey(pass: string, salt: Uint8Array) {
-  const base = await crypto.subtle.importKey("raw", enc.encode(pass), "PBKDF2", false, ["deriveKey"]);
-  return crypto.subtle.deriveKey({ name: "PBKDF2", salt: salt as BufferSource, iterations: 200_000, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-}
-
-/** The backup file's text. With a passphrase the content is encrypted (AES-GCM, key from PBKDF2); without, it is plain JSON. */
-export async function makeBackup(passphrase: string): Promise<string> {
-  const s = await keyStore();
-  if (!(await s.pk())) throw new Error("There is no identity to back up.");
-  const b: Backup = {
-    app: "freetunes", v: 1, sk: await s.exportSk(), created: Date.now(),
-    name: (await storeGet("artist")) ?? "",
-    releases: JSON.parse((await storeGet("releases")) ?? "[]"),
-  };
-  if (!passphrase) return JSON.stringify(b, null, 2);
-  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
-  const data = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await aesKey(passphrase, salt), enc.encode(JSON.stringify(b))));
-  return JSON.stringify({ app: "freetunes", v: 1, enc: { salt: hex(salt), iv: hex(iv), data: hex(data) } }, null, 2);
-}
-
-/** Is this backup text encrypted (so a passphrase is needed)? Throws if it is not a FreeTunes backup. */
-export function backupIsEncrypted(text: string): boolean {
-  const j = JSON.parse(text);
-  if (j?.app !== "freetunes") throw new Error("This is not a FreeTunes backup file.");
-  return !!j.enc;
-}
-
-export async function readBackup(text: string, passphrase: string): Promise<Backup> {
-  const j = JSON.parse(text);
-  if (j?.app !== "freetunes") throw new Error("This is not a FreeTunes backup file.");
-  let b = j;
-  if (j.enc) {
-    if (!passphrase) throw new Error("This backup is encrypted: enter its passphrase.");
-    try {
-      const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unhex(j.enc.iv) as BufferSource }, await aesKey(passphrase, unhex(j.enc.salt)), unhex(j.enc.data) as BufferSource);
-      b = JSON.parse(new TextDecoder().decode(plain));
-    } catch { throw new Error("Wrong passphrase, or the file is damaged."); }
-  }
-  if (!/^[0-9a-f]{64}$/.test(b.sk ?? "")) throw new Error("The backup does not contain a valid key.");
-  return b as Backup;
-}
-
-/** Replace the current identity with the one in a backup, and restore the artist name and your release list. */
-export async function restoreBackup(b: Backup): Promise<Identity> {
-  const s = await keyStore();
-  const me = asIdentity(s, await s.replace(b.sk));
-  await storePut("artist", b.name ?? "");
-  await storePut("releases", JSON.stringify(Array.isArray(b.releases) ? b.releases : []));
-  return me;
-}
-
-/** Replace the identity with a fresh key, or with `sk` (hex). The old one is gone unless it was backed up. */
-export async function replaceIdentity(sk?: string): Promise<Identity> {
-  const s = await keyStore();
-  return asIdentity(s, await s.replace(sk ?? newSecret()));
-}
-
-// ---- whoiam: link a persona without ever receiving a secret ("sign in with whoiam") ----
-/** Does this proof hold, and is it about `identityPk` (the key it was made for)? */
-export const verifyLink = async (l: WhoiamLink, identityPk: string) =>
-  l.challenge.endsWith(`.${identityPk}`) && (await verifyProof(l));
+export const signOut = () => storePut("session", "");
 
 /** The official whoiam web contract; any other whoiam site on this node can be used instead. */
 export const WHOIAM_KEY = "87upyDfYzYHVY1Ypu9knhGUGRdydz54FHrBB6Bp2VBTg";
 export const officialWhoiam = () => `${location.protocol}//${location.host}/v1/contract/web/${WHOIAM_KEY}/`;
-
 const LINK_MAX_AGE_MS = 10 * 60 * 1000;
 /** Our own address without query or hash: whoiam binds its proof to it. */
-export const linkBase = () => `${location.protocol}//${location.host}${location.pathname}`;
+export const linkBase = () => `${location.protocol}//${location.host}${APP_PATH}`;
 
-/** Where to send the user to pick a persona. Remembers the one-time challenge in the delegate store. */
-export async function startLink(whoiamUrl: string): Promise<string> {
-  const me = await requireIdentity();
+/** Where to send the user to sign in. Remembers the one-time challenge in the delegate store. */
+export async function startSignIn(whoiamUrl: string): Promise<string> {
   const u = new URL(whoiamUrl);
   if (u.host !== location.host || !/^\/v[12]\/contract\/web\/[^/]+\/?$/.test(u.pathname)) {
     throw new Error("Paste the address of your whoiam site on this node (it starts with the same host as this page).");
   }
-  const challenge = `${hex(crypto.getRandomValues(new Uint8Array(16)))}.${me.pk}`;
-  await storePut("link-pending", JSON.stringify({ challenge, base: linkBase(), at: Date.now() }));
+  const challenge = `wd1.${await appKey()}.${hex(crypto.getRandomValues(new Uint8Array(16)))}`;
+  await storePut("signin-pending", challenge);
   await storePut("whoiam-url", u.origin + u.pathname);
   return `${u.origin}${u.pathname}?connect=v1&challenge=${challenge}&return=${encodeURIComponent(linkBase())}`;
 }
 
-/** Handle whoiam's callback: check the challenge, freshness and signature, then keep the link. */
-export async function finishLink(q: URLSearchParams): Promise<WhoiamLink> {
+/** Handle whoiam's callback: check challenge, freshness and signature, then keep the delegation. Returns the persona. */
+export async function finishSignIn(q: URLSearchParams): Promise<string> {
   if (q.get("whoiam") === "denied") throw new Error("You chose not to share a persona.");
-  const pending = JSON.parse((await storeGet("link-pending")) || "null") as { challenge: string; base: string } | null;
-  await storePut("link-pending", ""); // one use: burn it whatever happens next
-  const l: WhoiamLink = { pk: q.get("pk") ?? "", sig: q.get("sig") ?? "", challenge: q.get("challenge") ?? "", ts: Number(q.get("ts")), base: pending?.base ?? "" };
-  if (!pending || l.challenge !== pending.challenge) throw new Error("This link request is unknown or was already used. Start again from the Identity page.");
-  if (!Number.isFinite(l.ts) || Math.abs(Date.now() - l.ts) > LINK_MAX_AGE_MS) throw new Error("The proof is too old or its clock is off. Start again.");
-  const me = await requireIdentity();
-  if (!(await verifyLink(l, me.pk))) throw new Error("The proof does not verify for this identity.");
-  await storePut("whoiam-link", JSON.stringify(l));
-  return l;
+  const pending = await storeGet("signin-pending");
+  await storePut("signin-pending", ""); // one use: burn it whatever happens next
+  const persona = q.get("pk") ?? "";
+  const cert: Cert = { base: linkBase(), challenge: q.get("challenge") ?? "", ts: Number(q.get("ts")), sig: q.get("sig") ?? "" };
+  if (!pending || cert.challenge !== pending) throw new Error("This sign-in is unknown or was already used. Start again from the Identity page.");
+  if (!Number.isFinite(cert.ts) || Math.abs(Date.now() - cert.ts) > LINK_MAX_AGE_MS) throw new Error("The proof is too old or its clock is off. Start again.");
+  if (!(await verifyProof({ ...cert, pk: persona }))) throw new Error("whoiam's signature does not verify.");
+  await storePut("session", JSON.stringify({ persona, cert }));
+  return persona;
 }
-
-/** The stored link, only if it still verifies for the current identity (a replaced identity invalidates it). */
-export async function currentLink(): Promise<WhoiamLink | null> {
-  try {
-    const me = await peekIdentity(), raw = await storeGet("whoiam-link");
-    if (!me || !raw) return null;
-    const l = JSON.parse(raw) as WhoiamLink;
-    return (await verifyLink(l, me.pk)) ? l : null;
-  } catch { return null; }
-}
-export const clearLink = () => storePut("whoiam-link", "");
 
 // small per-app store (artist name, my releases): the delegate when available, else localStorage, else memory
 const mem = new Map<string, string>();
@@ -473,14 +390,14 @@ export interface Release {
   legacy: boolean;
 }
 
-/** Publish a release. Parameters = owner pubkey || random salt, so one artist can publish any number of releases. */
+/** Publish a release. Parameters = owner persona || random salt || app path, so one artist can publish any number of releases. */
 export async function publishRelease(meta: Omit<ReleaseMeta, "ts">) {
   const me = await requireIdentity();
-  const params = me.pk + hex(crypto.getRandomValues(new Uint8Array(16)));
+  const params = me.pk + hex(crypto.getRandomValues(new Uint8Array(16))) + APP_PATH_HEX;
   const comments = meta.comments ?? (await createComments(params));
   const meta_json = JSON.stringify({ ...meta, comments, ts: Date.now() });
   const sig = await me.sign(`ftr1|${params}|${meta_json}`);
-  const instance = await retrying(() => putContract(releaseWasm, unhex(params), enc.encode(JSON.stringify({ meta_json, sig }))));
+  const instance = await retrying(() => putContract(releaseWasm, unhex(params), enc.encode(JSON.stringify({ meta_json, sig, cert: me.cert }))));
   return { instance, params };
 }
 
@@ -498,7 +415,7 @@ async function pushState(instance: string, params: string, meta: object, current
   const me = await requireIdentity(); // must be the release owner
   const meta_json = JSON.stringify({ ...meta, ts: Math.max(Date.now(), current + 1) });
   const sig = await me.sign(`ftr1|${params}|${meta_json}`);
-  try { await retrying(() => sendDelta(instance, { meta_json, sig })); }
+  try { await retrying(() => sendDelta(instance, { meta_json, sig, cert: me.cert })); }
   catch (e) {
     // a refused update is never answered: the client only sees a timeout
     if (!/timeout/i.test(String(e))) throw e;
@@ -559,7 +476,7 @@ export async function listRelease(instance: string, params: string, title: strin
   const sig = await me.sign(msg);
   const nonce = await mine(msg, POW_BITS);
   await loadDirectory(); // makes sure it exists and caches its full key for the update
-  await sendDelta(await directoryId(), { entries: { [instance]: { params, title, artist, cover, removed, ts, nonce, sig } } });
+  await sendDelta(await directoryId(), { entries: { [instance]: { params, title, artist, cover, removed, ts, nonce, sig, cert: me.cert } } });
 }
 
 /** Admin only: replace the blocklist (blocked releases disappear from the directory). */
@@ -585,7 +502,7 @@ export async function postComment(addr: string, params: string, track: number, n
   const ts = Date.now(), msg = `ftc1|${params}|${me.pk}|${track}|${ts}|${name}|${text}`;
   const sig = await me.sign(msg), nonce = await mine(msg, COMMENT_POW_BITS);
   const id = hex(sha256(enc.encode(msg))).slice(0, 32); // the contract derives the same id from the content
-  await retrying(() => sendDelta(addr, { items: { [id]: { a: me.pk, name, track, ts, text, nonce, sig } } }));
+  await retrying(() => sendDelta(addr, { items: { [id]: { a: me.pk, name, track, ts, text, nonce, sig, cert: me.cert } } }));
 }
 
 /** Remove a comment: allowed for its author and for the release owner (anyone else's removal is ignored). */
@@ -593,7 +510,7 @@ export async function removeComment(addr: string, params: string, id: string) {
   const me = await requireIdentity();
   const ts = Date.now(), msg = `ftc2|${params}|${id}|${ts}`;
   const sig = await me.sign(msg), nonce = await mine(msg, COMMENT_POW_BITS);
-  await retrying(() => sendDelta(addr, { removed: { [`${id}:${me.pk}`]: { by: me.pk, ts, nonce, sig } } }));
+  await retrying(() => sendDelta(addr, { removed: { [`${id}:${me.pk}`]: { by: me.pk, ts, nonce, sig, cert: me.cert } } }));
 }
 
 /** Is this comment hidden? Same rule as the contract: a removal by its author or by the release owner. */

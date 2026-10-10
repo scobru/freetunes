@@ -1,5 +1,7 @@
 //! Comments on one release, per track. One contract per release; its parameters are the release's own parameters
-//! (hex: owner pubkey || salt), so the contract knows who the release owner is.
+//! (hex: owner persona || salt || app path), so the contract knows who the release owner is. Authors and owners
+//! are whoiam personas: every comment and removal is signed by an app key the persona delegated for that app path
+//! (see `whoiam-delegation`) and carries the delegation.
 //!
 //! - A comment is signed by its author (`ftc1|...`) and carries a small proof-of-work, so posting costs a moment
 //!   of CPU and spam is not free. Anyone with a key can post; reading needs nothing.
@@ -7,11 +9,11 @@
 //!   never shadow the real one. It takes effect when the signer is the comment's author or the release owner;
 //!   anyone else's is stored but ignored. Removals are permanent, which keeps the merge a plain union.
 //! - The newest MAX_ITEMS comments and removals are kept, with a deterministic rule, so merge order does not matter.
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use whoiam_delegation::{check as check_cert, verify as verify_sig, Cert};
 
 pub const POW_BITS: u32 = 16;
 pub const MAX_ITEMS: usize = 1000;
@@ -27,15 +29,17 @@ pub struct Comment {
     pub ts: u64,
     pub text: String,
     pub nonce: u64,
-    pub sig: String, // hex, over `ftc1|<params>|<a>|<track>|<ts>|<name>|<text>`
+    pub sig: String, // hex, by the author's delegated app key, over `ftc1|<params>|<a>|<track>|<ts>|<name>|<text>`
+    pub cert: Cert,  // the author's delegation to that key
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Removal {
-    pub by: String, // signer public key, hex
+    pub by: String, // signer persona, hex
     pub ts: u64,
     pub nonce: u64,
-    pub sig: String, // hex, over `ftc2|<params>|<comment id>|<ts>`
+    pub sig: String, // hex, by the signer's delegated app key, over `ftc2|<params>|<comment id>|<ts>`
+    pub cert: Cert,  // the signer's delegation to that key
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -56,17 +60,15 @@ pub struct Summary {
 
 type R<T> = Result<T, String>;
 
-fn key(hexstr: &str) -> R<VerifyingKey> {
-    let b: [u8; 32] = hex::decode(hexstr)
-        .map_err(|e| e.to_string())?
-        .try_into()
-        .map_err(|_| "pubkey must be 32 bytes")?;
-    VerifyingKey::from_bytes(&b).map_err(|e| e.to_string())
+/// The app path at the end of the release parameters (after owner and salt).
+fn app_of(params: &str) -> R<String> {
+    let raw = hex::decode(params).map_err(|e| e.to_string())?;
+    String::from_utf8(raw.get(48..).ok_or("params too short")?.to_vec()).map_err(|e| e.to_string())
 }
 
-fn verify(who: &str, msg: &str, sig_hex: &str) -> R<()> {
-    let sig = Signature::from_slice(&hex::decode(sig_hex).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    key(who)?.verify(msg.as_bytes(), &sig).map_err(|_| "bad signature".to_string())
+/// `msg` is signed by an app key that persona `who` delegated for this release's app.
+fn verify(params: &str, who: &str, cert: &Cert, msg: &str, sig_hex: &str) -> R<()> {
+    verify_sig(&check_cert(who, &app_of(params)?, cert)?, msg.as_bytes(), sig_hex)
 }
 
 fn zero_bits(h: &[u8]) -> u32 {
@@ -116,7 +118,7 @@ pub fn check_comment(params: &str, id: &str, c: &Comment) -> R<()> {
     if !pow_ok(&msg, c.nonce) {
         return Err("insufficient proof of work".into());
     }
-    verify(&c.a, &msg, &c.sig)
+    verify(params, &c.a, &c.cert, &msg, &c.sig)
 }
 
 pub fn removal_key(id: &str, by: &str) -> String {
@@ -132,11 +134,12 @@ pub fn check_removal(params: &str, key: &str, r: &Removal) -> R<()> {
     if !pow_ok(&msg, r.nonce) {
         return Err("insufficient proof of work".into());
     }
-    verify(&r.by, &msg, &r.sig)
+    verify(params, &r.by, &r.cert, &msg, &r.sig)
 }
 
 fn owner_of(params: &str) -> R<&str> {
-    params.get(..64).ok_or_else(|| "params too short".to_string())
+    app_of(params)?; // also checks the length
+    Ok(&params[..64])
 }
 
 /// Does a removal actually hide this comment? Only the comment's author and the release owner may remove it.
@@ -280,24 +283,38 @@ mod tests {
     fn pk(k: &SigningKey) -> String {
         hex::encode(k.verifying_key().to_bytes())
     }
+    const APP: &str = "/v1/contract/web/Tunes1/";
+    fn release(owner: &SigningKey, salt: &str) -> String {
+        format!("{}{}{}", pk(owner), salt.repeat(16), hex::encode(APP))
+    }
+    /// Persona `who` delegates the app key `sk(100 + n)` for this app.
+    fn cert(who: &SigningKey) -> Cert {
+        let app_key = pk(&app_key_of(who));
+        let (base, challenge) = (format!("http://127.0.0.1:7509{APP}"), format!("wd1.{app_key}.n1"));
+        let sig = who.sign(&whoiam_delegation::connect_message(who.verifying_key().as_bytes(), &base, &challenge, 1));
+        Cert { base, challenge, ts: 1, sig: hex::encode(sig.to_bytes()) }
+    }
+    fn app_key_of(who: &SigningKey) -> SigningKey {
+        SigningKey::from_bytes(&[who.to_bytes()[0].wrapping_add(100); 32])
+    }
     fn mine(msg: &str) -> u64 {
         (0u64..).find(|n| pow_ok(msg, *n)).unwrap()
     }
 
     /// A valid comment with a real proof of work (about 2^16 hashes).
     fn comment(params: &str, who: &SigningKey, track: u8, ts: u64, text: &str) -> (String, Comment) {
-        let mut c = Comment { a: pk(who), name: "Ann".into(), track, ts, text: text.into(), nonce: 0, sig: String::new() };
+        let mut c = Comment { a: pk(who), name: "Ann".into(), track, ts, text: text.into(), nonce: 0, sig: String::new(), cert: cert(who) };
         let msg = comment_msg(params, &c);
-        c.sig = hex::encode(who.sign(msg.as_bytes()).to_bytes());
+        c.sig = hex::encode(app_key_of(who).sign(msg.as_bytes()).to_bytes());
         c.nonce = mine(&msg);
         (comment_id(params, &c), c)
     }
 
     /// A removal of comment `id` by `who`, as (key, removal).
     fn removal(params: &str, who: &SigningKey, id: &str, ts: u64) -> (String, Removal) {
-        let mut r = Removal { by: pk(who), ts, nonce: 0, sig: String::new() };
+        let mut r = Removal { by: pk(who), ts, nonce: 0, sig: String::new(), cert: cert(who) };
         let msg = removal_msg(params, id, &r);
-        r.sig = hex::encode(who.sign(msg.as_bytes()).to_bytes());
+        r.sig = hex::encode(app_key_of(who).sign(msg.as_bytes()).to_bytes());
         r.nonce = mine(&msg);
         (removal_key(id, &r.by), r)
     }
@@ -309,11 +326,11 @@ mod tests {
     #[test]
     fn comments_are_signed_and_bound_to_the_release() {
         let (owner, ann) = (sk(1), sk(2));
-        let params = format!("{}{}", pk(&owner), "aa".repeat(16));
+        let params = release(&owner, "aa");
         let (id, c) = comment(&params, &ann, 0, 10, "Great track");
         check_comment(&params, &id, &c).unwrap();
         // another release (same owner, other salt): the signature does not carry over
-        assert!(check_comment(&format!("{}{}", pk(&owner), "bb".repeat(16)), &id, &c).is_err());
+        assert!(check_comment(&release(&owner, "bb"), &id, &c).is_err());
         // edited text, forged author, wrong id, no proof of work, bad content
         let mut edited = c.clone();
         edited.text = "Terrible track".into();
@@ -336,7 +353,7 @@ mod tests {
     #[test]
     fn who_may_remove_what() {
         let (owner, ann, eve) = (sk(1), sk(2), sk(3));
-        let params = format!("{}{}", pk(&owner), "aa".repeat(16));
+        let params = release(&owner, "aa");
         let mut s = State::default();
         let (id, c) = comment(&params, &ann, 1, 10, "hello");
         apply(&params, &mut s, delta_of(vec![(id.clone(), c)], vec![])).unwrap();
@@ -366,7 +383,7 @@ mod tests {
     #[test]
     fn merge_delta_and_prune() {
         let (owner, ann) = (sk(1), sk(2));
-        let params = format!("{}{}", pk(&owner), "aa".repeat(16));
+        let params = release(&owner, "aa");
         let (i1, c1) = comment(&params, &ann, 0, 10, "one");
         let (i2, c2) = comment(&params, &ann, 0, 20, "two");
         // same entries in either order give the same state

@@ -1,9 +1,9 @@
 import "./style.css";
 import {
-  backupIsEncrypted, blockReleases, clearLink, createIdentity, currentLink, deleteRelease, finishLink, flushKnown, officialWhoiam, fmtTime, getChunk,
-  isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeBackup, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
-  postComment, putChunk, readBackup, removeComment, replaceIdentity, restoreBackup, splitMp3, startLink, storeGet, storePut, Streamer, updateRelease,
-  verifyLink, watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
+  APP_PATH_HEX, blockReleases, deleteRelease, finishSignIn, flushKnown, officialWhoiam, fmtTime, getChunk,
+  isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
+  postComment, putChunk, removeComment, signOut, splitMp3, startSignIn, storeGet, storePut, Streamer, updateRelease,
+  watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -32,7 +32,7 @@ function route() {
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
   const h = location.hash;
   const q = new URLSearchParams(location.search);
-  if (q.has("whoiam")) return linkCallback(q);
+  if (q.has("whoiam")) return signInCallback(q);
   const here = h === "#/publish" ? "publish" : h === "#/identity" ? "identity" : h === "" || h === "#/" ? "explore" : "";
   document.querySelectorAll<HTMLElement>("[data-nav]").forEach((a) => a.toggleAttribute("aria-current", a.dataset.nav === here));
   window.scrollTo(0, 0);
@@ -41,7 +41,7 @@ function route() {
   if (h === "#/admin") return admin();
   const ar = h.match(/^#\/a\/([0-9a-f]{64})$/);
   if (ar) return artistPage(ar[1]);
-  const m = h.match(/^#\/(r|edit)\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96})$/);
+  const m = h.match(/^#\/(r|edit)\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96,})$/);
   if (m?.[1] === "edit") return editPage(m[2], m[3]);
   return m ? releasePage(m[2], m[3]) : explore();
 }
@@ -98,7 +98,8 @@ async function explore() {
     lazyCovers($("#mine"));
   });
   try {
-    const rows = Object.entries((await loadDirectory()).entries).filter(([, e]) => !e.removed).sort(([, a], [, b]) => b.ts - a.ts);
+    // only releases of this app: an entry is checked against the app path in its own parameters
+    const rows = Object.entries((await loadDirectory()).entries).filter(([, e]) => !e.removed && e.params.slice(96) === APP_PATH_HEX).sort(([, a], [, b]) => b.ts - a.ts);
     $("#list").innerHTML = rows.length
       ? `<div class="grid">${rows.map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover, ` · ${new Date(e.ts).toLocaleDateString()}`)).join("")}</div>`
       : `<div class="empty">No releases listed yet. Be the first to publish one.</div>`;
@@ -111,7 +112,7 @@ async function artistPage(pk: string) {
   app.innerHTML = `<p class="muted">Loading... (the first visit on a node can take up to 30 s)</p>`;
   try {
     const [dir, me] = await Promise.all([loadDirectory(), peekIdentity()]);
-    const rows = Object.entries(dir.entries).filter(([, e]) => e.params.slice(0, 64) === pk && !e.removed).sort(([, a], [, b]) => b.ts - a.ts);
+    const rows = Object.entries(dir.entries).filter(([, e]) => e.params.slice(0, 64) === pk && !e.removed && e.params.slice(96) === APP_PATH_HEX).sort(([, a], [, b]) => b.ts - a.ts);
     const yours = me?.pk === pk;
     // your own releases that are not in the directory (private links) show up on your page too
     const listed = new Set(rows.map(([id]) => id));
@@ -140,7 +141,7 @@ async function editPage(instance: string, params: string) {
   try {
     const rel = await loadRelease(instance, params);
     const me = await peekIdentity();
-    if (me?.pk !== params.slice(0, 64)) return void (app.innerHTML = `<div class="gone"><h1>Not your release</h1><p class="muted">Only the artist who published it can edit it, from the node where they published.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
+    if (me?.pk !== params.slice(0, 64)) return void (app.innerHTML = `<div class="gone"><h1>Not your release</h1><p class="muted">Only the artist who published it can edit it, signed in with the same whoiam persona.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
     if (rel.meta.deleted) return void (app.innerHTML = `<div class="gone"><h1>Release removed</h1><a class="btn" href="#/">Back</a></div>`);
     if (rel.legacy) return void (app.innerHTML = `<div class="gone"><h1>Cannot edit this release</h1><p class="muted">It was published with an older version of FreeTunes, before editing existed. Publish it again to get a release you can edit.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
     return releaseForm(rel);
@@ -277,7 +278,7 @@ function releaseForm(existing?: Release) {
         tracks.push({ title: it.title.trim(), chunks });
       }
       await flushKnown();
-      const meta = { title, artist, license, rights: true, cover, tracks, persona: (await currentLink()) ?? undefined, comments: m?.comments, about: $<HTMLTextAreaElement>("#about").value.trim().slice(0, 2000) || undefined };
+      const meta = { title, artist, license, rights: true, cover, tracks, comments: m?.comments, about: $<HTMLTextAreaElement>("#about").value.trim().slice(0, 2000) || undefined };
       msg.textContent = edit ? "Saving..." : "Publishing the release...";
       let instance: string, params: string;
       if (existing) {
@@ -504,11 +505,9 @@ async function releasePage(instance: string, params: string) {
   $("#refresh").onclick = (e) => { e.preventDefault(); void releasePage(instance, params); };
 
   // owner tools: only the artist's own key matches the first 32 bytes of the contract parameters
-  if (m.persona) { // a whoiam persona vouches for the artist's key: show it only if the proof holds
-    const p = m.persona;
-    void verifyLink(p, params.slice(0, 64)).then((ok) => {
-      if (ok) $(".chips").insertAdjacentHTML("beforeend", `<span class="chip hot" title="whoiam persona ${esc(personaName(p.pk))}">whoiam \u2713 ${esc(personaName(p.pk).slice(0, 8))}\u2026</span>`);
-    });
+  if (params.length > 96) { // the owner is a whoiam persona (releases from before personas carry no app path)
+    const p = params.slice(0, 64);
+    $(".chips").insertAdjacentHTML("beforeend", `<span class="chip hot" title="whoiam persona ${esc(personaName(p))}">whoiam ${esc(personaName(p).slice(0, 8))}\u2026</span>`);
   }
   void meReady.then((id) => {
     if (id?.pk !== params.slice(0, 64)) return;
@@ -551,183 +550,76 @@ function confirmRemoval(rel: Release) {
 }
 
 // ---------------- identity ----------------
-const shortKey = (pk: string) => `${pk.slice(0, 8)}\u2026${pk.slice(-8)}`;
 
-/** Publishing needs an identity. Listening does not, so nothing creates one until the user chooses to. */
+/** Publishing needs an identity. Listening does not, so nothing asks for one until the user chooses to. */
 async function publishPage() {
   if (await peekIdentity()) return releaseForm();
   app.innerHTML = `
     <h1>Publish a release</h1>
     <div class="card">
-      <h2>First, an identity</h2>
-      <p class="muted">An identity is the key that proves a release is yours and lets you edit or remove it later. Create one, or import a backup if you already have one.</p>
-      <div class="actions"><a class="btn primary" href="#/identity">Create or import an identity</a></div>
+      <h2>First, sign in</h2>
+      <p class="muted">Your releases belong to your <b>whoiam</b> persona, which proves they are yours and lets you edit or remove them from any node.</p>
+      <div class="actions"><a class="btn primary" href="#/identity">Sign in with whoiam</a></div>
     </div>`;
 }
 
-/** Create, back up, import and replace the identity. */
+/** Sign in with a whoiam persona (once per node), set the artist name, sign out. */
 async function identityPage() {
   app.innerHTML = `<h1>Identity</h1><div id="idbox"><p class="muted">Loading...</p></div>`;
   const box = $("#idbox");
-  const download = (text: string, pk: string) => {
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
-    a.download = `freetunes-identity-${pk.slice(0, 8)}.json`;
-    a.click();
-  };
+  let me: Identity | null;
+  try { me = await peekIdentity(); } catch (e) { box.innerHTML = `<p class="err">Could not read the identity: ${esc(String(e))}</p>`; return; }
 
-  /** Import card shared by the "no identity" and "have identity" views: paste a backup, or pick a file that fills the box. */
-  const importCard = (replacing: boolean) => `
-    <div class="card">
-      <h2>Import a backup</h2>
-      <p class="muted">${replacing ? "This <b>replaces</b> your current identity. You will lose control of the releases made with it unless you exported it first." : "Restore an identity on this node or a new one."}
-        Paste the text of a FreeTunes backup, or choose the file.</p>
-      <textarea id="bpaste" rows="4" spellcheck="false" autocomplete="off" placeholder="Paste the backup here"></textarea>
-      <label class="drop small" id="bdrop"><input id="bfile" type="file" accept=".json,.txt,application/json,text/plain" />or choose a file</label>
-      <label class="field" id="bpass-row" hidden><span>Passphrase</span><input id="bpass" type="password" autocomplete="off" /></label>
-      ${replacing ? `<label class="check"><input id="bsure" type="checkbox" />I understand that this replaces my current identity.</label>` : ""}
-      <div class="actions"><button id="bgo" type="button" disabled>Import</button><span id="bmsg" class="muted"></span></div>
-    </div>`;
-
-  const wireImport = (replacing: boolean, after: () => void) => {
-    const paste = $<HTMLTextAreaElement>("#bpaste"), pass = $<HTMLInputElement>("#bpass"), go = $<HTMLButtonElement>("#bgo"), msg = $("#bmsg");
-    const sure = app.querySelector<HTMLInputElement>("#bsure");
-    let valid = false;
-    const ready = () => (go.disabled = !valid || (replacing && !sure?.checked));
-    const analyze = () => {
-      const text = paste.value.trim();
-      valid = false; $("#bpass-row").hidden = true; msg.textContent = "";
-      if (text) {
-        try { $("#bpass-row").hidden = !backupIsEncrypted(text); valid = true; }
-        catch { msg.textContent = "Not recognised: paste a FreeTunes backup. To use a whoiam persona, link it below instead of pasting its seed."; }
-      }
-      ready();
-    };
-    paste.oninput = analyze;
-    $<HTMLInputElement>("#bfile").onchange = async (e) => {
-      const f = (e.target as HTMLInputElement).files?.[0];
-      if (f) { paste.value = await f.text(); analyze(); }
-    };
-    if (sure) sure.onchange = ready;
-    go.onclick = async () => {
-      go.disabled = true;
-      try {
-        msg.textContent = "Importing...";
-        await restoreBackup(await readBackup(paste.value.trim(), pass.value));
-        paste.value = "";
-        after();
-      } catch (e) { msg.textContent = String((e as Error).message ?? e); ready(); }
-    };
-  };
-
-  const draw = async (justCreated = false) => {
-    let me: Identity | null;
-    try { me = await peekIdentity(); } catch (e) { box.innerHTML = `<p class="err">Could not read the identity: ${esc(String(e))}</p>`; return; }
-
-    if (!me) {
-      box.innerHTML = `
-        <p class="muted">Your identity is a key that proves your releases are yours and lets you edit or remove them. It is created on your node. Back it up to use it elsewhere or to recover it.</p>
-        <div class="card">
-          <h2>Create your identity</h2>
-          <label class="field"><span>Artist name</span><input id="name" maxlength="80" placeholder="Used as the default artist when you publish" /></label>
-          <div class="actions"><button id="create" class="primary" type="button">Create identity</button><span id="msg" class="muted"></span></div>
-        </div>${importCard(false)}`;
-      $("#create").onclick = async () => {
-        const btn = $<HTMLButtonElement>("#create");
-        btn.disabled = true;
-        try {
-          $("#msg").textContent = "Creating...";
-          await createIdentity();
-          const name = $<HTMLInputElement>("#name").value.trim();
-          if (name) await storePut("artist", name);
-          await draw(true);
-        } catch (e) { $("#msg").textContent = `Error: ${e}`; btn.disabled = false; }
-      };
-      wireImport(false, () => void draw());
-      return;
-    }
-
-    const name = (await storeGet("artist")) ?? "";
+  if (!me) {
+    const saved = (await storeGet("whoiam-url")) || officialWhoiam();
     box.innerHTML = `
-      ${justCreated ? `<p class="notice"><b>Identity created. Download a backup now.</b> If you lose this node or clear its data, the backup is the only way to edit or remove your releases again.</p>` : ""}
-      ${me.persisted ? "" : `<p class="notice"><b>This browser cannot keep your key between visits.</b> Download a backup and import it when you come back.</p>`}
+      <p class="muted">Your identity is your <b>whoiam</b> persona: the same one you use in other Freenet apps. Sign in once on this node: whoiam opens, you pick a persona, and it lets FreeTunes publish and comment on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
       <div class="card">
-        <h2>Your identity</h2>
-        <label class="field"><span>Artist name</span><input id="name" maxlength="80" value="${esc(name)}" /></label>
-        <p class="muted">Public key <code>${esc(shortKey(me.pk))}</code></p>
-        <div class="actions"><button id="savename" type="button">Save name</button><a class="btn primary" href="#/publish">Publish a release</a><span id="nmsg" class="muted"></span></div>
-      </div>
-      <div class="card">
-        <h2>Export a backup</h2>
-        <p class="muted">The file holds your key and your list of releases. <b>Anyone who has it can publish and edit as you.</b> A passphrase encrypts it (recommended); without one it is plain text.</p>
-        <label class="field"><span>Passphrase (optional)</span><input id="epass" type="password" autocomplete="off" /></label>
-        <div class="actions"><button id="export" class="primary" type="button">Download backup</button><span id="emsg" class="muted"></span></div>
-      </div>
-      <div class="card" id="whoiam-card"><h2>whoiam</h2><p class="muted">Loading...</p></div>
-      ${importCard(true)}
-      <div class="card">
-        <h2>Start over</h2>
-        <p class="muted">Create a new identity with a new key. The old one is gone unless you exported it, and so is the control of its releases.</p>
-        <label class="check"><input id="osure" type="checkbox" />I understand that this replaces my current identity.</label>
-        <div class="actions"><button id="fresh" class="danger" type="button" disabled>Create a new identity</button></div>
+        <h2>Sign in with whoiam</h2>
+        <label class="field"><span>Address of your whoiam site <small class="muted">(official by default, or paste your own)</small></span><input id="wurl" value="${esc(saved)}" placeholder="${esc(officialWhoiam())}" spellcheck="false" /></label>
+        <div class="actions"><button id="wgo" class="primary" type="button">Sign in with whoiam</button><button id="wofficial" type="button">Use official</button><span id="wmsg" class="muted"></span></div>
       </div>`;
-    void drawWhoiam(me);
-    $("#savename").onclick = async () => { await storePut("artist", $<HTMLInputElement>("#name").value.trim()); $("#nmsg").textContent = "Saved."; };
-    $("#export").onclick = async () => {
+    $("#wofficial").onclick = () => { $<HTMLInputElement>("#wurl").value = officialWhoiam(); };
+    $("#wgo").onclick = async () => {
       try {
-        $("#emsg").textContent = "Preparing...";
-        download(await makeBackup($<HTMLInputElement>("#epass").value), me!.pk);
-        $("#emsg").textContent = "Downloaded. Keep it somewhere safe.";
-      } catch (e) { $("#emsg").textContent = `Error: ${e}`; }
+        $("#wmsg").textContent = "Opening whoiam...";
+        goTo(await startSignIn($<HTMLInputElement>("#wurl").value.trim()));
+      } catch (e) { $("#wmsg").textContent = String((e as Error).message ?? e); }
     };
-    wireImport(true, () => void draw());
-    $<HTMLInputElement>("#osure").onchange = (e) => ($<HTMLButtonElement>("#fresh").disabled = !(e.target as HTMLInputElement).checked);
-    $("#fresh").onclick = async () => { await replaceIdentity(); await draw(true); };
-  };
-  await draw();
+    return;
+  }
+
+  const name = (await storeGet("artist")) ?? "";
+  box.innerHTML = `
+    <div class="card">
+      <h2>Signed in</h2>
+      <p>whoiam persona <code title="${esc(me.pk)}">${esc(personaName(me.pk))}</code></p>
+      <label class="field"><span>Artist name</span><input id="name" maxlength="80" value="${esc(name)}" placeholder="Used as the default artist when you publish" /></label>
+      <div class="actions"><button id="savename" type="button">Save name</button><a class="btn primary" href="#/publish">Publish a release</a><a class="btn" href="#/a/${esc(me.pk)}">Your artist page</a><span id="nmsg" class="muted"></span></div>
+    </div>
+    <div class="card">
+      <h2>Sign out</h2>
+      <p class="muted">This node forgets the sign-in. Your releases stay yours: sign in again, here or on another node, to edit them.</p>
+      <div class="actions"><button id="out" type="button">Sign out</button></div>
+    </div>`;
+  $("#savename").onclick = async () => { await storePut("artist", $<HTMLInputElement>("#name").value.trim()); $("#nmsg").textContent = "Saved."; };
+  $("#out").onclick = async () => { await signOut(); await identityPage(); };
 }
 
 /** Open another page of this node (or any URL outside the sandbox) the way the Freenet shell allows. */
 const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
 
-/** Link a whoiam persona to this identity: whoiam signs a proof, FreeTunes never receives any secret. */
-async function drawWhoiam(me: Identity) {
-  const card = $("#whoiam-card");
-  const link = await currentLink();
-  if (link) {
-    card.innerHTML = `<h2>whoiam</h2>
-      <p>Linked to the whoiam persona <code>${esc(personaName(link.pk))}</code> <span class="muted">since ${new Date(link.ts).toLocaleDateString()}</span></p>
-      <p class="muted"><small>Your releases show a whoiam badge. whoiam signed that it knows this FreeTunes key; it never gave FreeTunes any key.</small></p>
-      <div class="actions"><button id="unlink" type="button">Unlink</button></div>`;
-    $("#unlink").onclick = async () => { await clearLink(); await drawWhoiam(me); };
-    return;
-  }
-  const saved = (await storeGet("whoiam-url")) || officialWhoiam();
-  card.innerHTML = `<h2>whoiam</h2>
-    <p class="muted">Prove that one of your <b>whoiam</b> personas stands behind this identity, without sharing any key or seed. whoiam opens, you choose a persona, and you come back here.</p>
-    <label class="field"><span>Address of your whoiam site <small class="muted">(official by default, or paste your own)</small></span><input id="wurl" value="${esc(saved)}" placeholder="${esc(officialWhoiam())}" spellcheck="false" /></label>
-    <div class="actions"><button id="wgo" class="primary" type="button">Link a whoiam persona</button><button id="wofficial" type="button">Use official</button><span id="wmsg" class="muted"></span></div>`;
-  $("#wofficial").onclick = () => { $<HTMLInputElement>("#wurl").value = officialWhoiam(); };
-  $("#wgo").onclick = async () => {
-    try {
-      $("#wmsg").textContent = "Opening whoiam...";
-      goTo(await startLink($<HTMLInputElement>("#wurl").value.trim()));
-    } catch (e) { $("#wmsg").textContent = String((e as Error).message ?? e); }
-  };
-}
-
 /** whoiam sent the user back here with its proof (or a refusal). */
-async function linkCallback(q: URLSearchParams) {
+async function signInCallback(q: URLSearchParams) {
   app.innerHTML = `<h1>whoiam</h1><p class="muted">Checking the proof...</p>`;
   let html: string;
   try {
-    const l = await finishLink(q);
-    html = `<div class="notice"><b>Linked.</b> The whoiam persona <code>${esc(personaName(l.pk))}</code> now stands behind this identity.</div>`;
+    html = `<div class="notice"><b>Signed in</b> as the whoiam persona <code>${esc(personaName(await finishSignIn(q)))}</code>.</div>`;
   } catch (e) {
-    html = `<div class="notice"><b>Not linked.</b> ${esc(String((e as Error).message ?? e))}</div>`;
+    html = `<div class="notice"><b>Not signed in.</b> ${esc(String((e as Error).message ?? e))}</div>`;
   }
   history.replaceState(null, "", location.pathname + "#/identity"); // the query must not run twice
-  app.innerHTML = `<h1>whoiam</h1>${html}<div class="actions"><a class="btn primary" href="#/identity">Back to Identity</a></div>`;
+  app.innerHTML = `<h1>whoiam</h1>${html}<div class="actions"><a class="btn primary" href="#/identity">Continue</a></div>`;
 }
 
 // ---------------- admin: hide releases from the directory with the admin key (hash #/admin) ----------------

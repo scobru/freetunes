@@ -1,19 +1,22 @@
 //! A release: title, artist, licence, cover and tracks; each track is an ordered list of chunk addresses.
-//! Parameters = hex(owner pubkey (32 bytes) || random salt), so one artist can publish any number of releases.
-//! The state is signed by the owner (message bound to the full parameters). The owner can edit it: a newer
+//! Parameters = owner (a whoiam persona, 32 bytes) || random salt (16 bytes) || app path
+//! (`/v1/contract/web/<FreeTunes id>/`), so one artist can publish any number of releases.
+//! The state is signed by an app key the owner delegated for that app path (see `whoiam-delegation`), carries
+//! the delegation, and the message is bound to the full parameters. The owner can edit it: a newer
 //! signed state replaces the older one (last write wins by `ts`), everything else is refused.
 //! The owner can also take it down with a signed tombstone (`deleted: true`, no content). The chunks themselves
 //! cannot be erased from Freenet; the tombstone only removes the references to them.
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
+use whoiam_delegation::{check as check_cert, verify as verify_sig, Cert};
 
 pub const LICENSES: [&str; 5] = ["own", "cc-by", "cc-by-sa", "cc0", "public-domain"];
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Release {
     pub meta_json: String, // the exact string that was signed
-    pub sig: String,       // hex ed25519 over `ftr1|<params_hex>|<meta_json>`
+    pub sig: String,       // hex ed25519, by the owner's delegated app key, over `ftr1|<params_hex>|<meta_json>`
+    pub cert: Option<Cert>, // the owner's delegation to that key
 }
 
 #[derive(Deserialize)]
@@ -101,14 +104,16 @@ fn check_meta(m: &Meta) -> R<()> {
     Ok(())
 }
 
+/// The app path at the end of the parameters (after owner and salt).
+pub fn app_of(params: &str) -> R<String> {
+    let raw = hex::decode(params).map_err(|e| e.to_string())?;
+    String::from_utf8(raw.get(48..).ok_or("params too short")?.to_vec()).map_err(|e| e.to_string())
+}
+
 fn verify(params: &str, s: &Release) -> R<()> {
-    let owner: [u8; 32] = hex::decode(params.get(..64).ok_or("params too short")?)
-        .map_err(|e| e.to_string())?
-        .try_into()
-        .map_err(|_| "owner key must be 32 bytes")?;
-    let key = VerifyingKey::from_bytes(&owner).map_err(|e| e.to_string())?;
-    let sig = Signature::from_slice(&hex::decode(&s.sig).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    key.verify(format!("ftr1|{params}|{}", s.meta_json).as_bytes(), &sig).map_err(|_| "bad signature".to_string())
+    let app = app_of(params)?; // first: it also checks that params are long enough to slice
+    let app_key = check_cert(&params[..64], &app, s.cert.as_ref().ok_or("no delegation")?)?;
+    verify_sig(&app_key, format!("ftr1|{params}|{}", s.meta_json).as_bytes(), &s.sig)
 }
 
 /// Validate a signed release; returns its timestamp.
@@ -227,11 +232,21 @@ mod tests {
     fn sk(n: u8) -> SigningKey {
         SigningKey::from_bytes(&[n; 32])
     }
+    const APP: &str = "/v1/contract/web/Tunes1/";
     fn params(k: &SigningKey, salt: &str) -> String {
-        format!("{}{}", hex::encode(k.verifying_key().to_bytes()), salt.repeat(16))
+        format!("{}{}{}", hex::encode(k.verifying_key().to_bytes()), salt.repeat(16), hex::encode(APP))
     }
+    /// Persona `k` delegates an app key for `app`.
+    fn cert(k: &SigningKey, app: &str) -> Cert {
+        let app_key = hex::encode(sk(100).verifying_key().to_bytes());
+        let (base, challenge) = (format!("http://127.0.0.1:7509{app}"), format!("wd1.{app_key}.n1"));
+        let sig = k.sign(&whoiam_delegation::connect_message(k.verifying_key().as_bytes(), &base, &challenge, 1));
+        Cert { base, challenge, ts: 1, sig: hex::encode(sig.to_bytes()) }
+    }
+    /// A release state by persona `k`, signed with its delegated app key.
     fn signed(k: &SigningKey, params: &str, meta: &str) -> Release {
-        Release { meta_json: meta.into(), sig: hex::encode(k.sign(format!("ftr1|{params}|{meta}").as_bytes()).to_bytes()) }
+        let sig = hex::encode(sk(100).sign(format!("ftr1|{params}|{meta}").as_bytes()).to_bytes());
+        Release { meta_json: meta.into(), sig, cert: Some(cert(k, APP)) }
     }
     fn meta(title: &str, ts: u64) -> String {
         format!(
@@ -283,6 +298,9 @@ mod tests {
         }
         assert!(check(&p, &signed(&owner, &p, r#"{"title":"x","artist":"y","license":"cc0","rights":true,"ts":1,"tracks":[]}"#)).is_err());
         assert!(check("abcd", &v1).is_err()); // params too short
+        // no delegation, or a delegation for another app
+        assert!(check(&p, &Release { cert: None, ..v1.clone() }).is_err());
+        assert!(check(&p, &Release { cert: Some(cert(&owner, "/v1/contract/web/Other/")), ..v1.clone() }).is_err());
     }
 
     #[test]

@@ -25,11 +25,11 @@ Everything is a Freenet contract:
 | Contract | What it holds | Address |
 | --- | --- | --- |
 | **Chunk** (`chunk/`) | A slice of a file (audio or cover). Immutable. | `blake3(code \|\| blake3(content))`: a chunk can be checked against its address |
-| **Release** (`release/`) | Title, artist, licence, rights declaration, cover and, per track, the ordered chunk addresses with sizes and durations. Signed by the artist. The artist can replace it with a newer signed state (last write wins by timestamp) or with a signed tombstone that drops every reference to the audio. | `blake3(code \|\| owner key \|\| random salt)` |
+| **Release** (`release/`) | Title, artist, licence, rights declaration, cover and, per track, the ordered chunk addresses with sizes and durations. Signed by the artist (a whoiam persona, through a delegated app key). The artist can replace it with a newer signed state (last write wins by timestamp) or with a signed tombstone that drops every reference to the audio. | `blake3(code \|\| owner persona \|\| random salt \|\| app path)` |
 | **Directory** (`directory/`) | Public list of releases. Each entry (title, artist, cover address) is signed by the release owner and carries a proof-of-work. The owner can replace it or mark it removed; the tombstone stays so an older entry cannot come back. The newest 500 are kept. The admin key can publish a signed blocklist. | one shared instance (its parameter is the admin public key) |
 | **Comments** (`comments/`) | The comments of one release, per track. Each comment is signed by its author and carries a small proof-of-work; removals are signed too and only count when made by the comment's author or the release owner. The newest 1000 are kept. | `blake3(code \|\| release parameters)`: one per release, created by the owner when publishing or editing |
 | **Reports** (`reports/`) | Reports about releases and tracks: kind (copyright, illegal, other), a note, an optional contact and an **ante proof**. One report per release, track and ante identity. The newest 2000 are kept. | one shared instance (no parameters) |
-| **Identity delegate** (`delegate/`) | The artist's signing key, plus a small per-app store (artist name, your releases, published chunk addresses). | one per calling web app |
+| **Identity delegate** (`delegate/`) | The node's app key (disposable, delegated by your whoiam persona), plus a small per-app store (session, artist name, your releases, published chunk addresses). | one per calling web app |
 
 The release contract refuses anything that does not carry `rights: true`, a known licence and valid, signed metadata, edits included. Only the key the release was created with can edit or remove it. Signatures are bound to the full contract parameters, so a signed release cannot be cloned into another contract.
 
@@ -53,25 +53,17 @@ The ante delegate is shipped in `ui/src/ante-delegate.wasm` and pinned: the page
 
 Tracks are split at MP3 frame boundaries into chunks of about 512 KB, so every chunk is a valid stand-alone stream. The player appends them to a `MediaSource` in order, fetching the next while the current one is appended, and falls back to downloading the whole track when the browser cannot stream `audio/mpeg` that way.
 
-### Identity
+### Identity: your whoiam persona
 
-An identity is an ed25519 key kept by the identity delegate in your node. It is created **on purpose**, on the Identity page (menu), with an artist name: nothing creates a key for people who only browse and listen, and publishing without one sends you there. Right after creating it the page asks you to download a backup.
+There is no FreeTunes account and no key to back up. Your identity is your [whoiam](https://github.com/skandragon/freenet-whoiam) persona, the same one other Freenet apps (FreeNames, FreePolls) use. Sign in once per node on the Identity page:
 
-- **Export**: a file with the key, the artist name and your list of releases. With a passphrase it is encrypted (AES-GCM, key derived with PBKDF2); without one it is plain JSON, and anyone who has it can publish and edit as you.
-- **Import**: paste the text of a FreeTunes backup into the box, or pick the file. It restores the key, the artist name and your release list, on this node or a new one. It replaces the current identity, so it asks for confirmation.
-- **Start over**: a new key. The old one is gone unless it was exported.
+1. The node keeps a random **app key** (identity delegate). FreeTunes opens whoiam's sign-in with the challenge `wd1.<app key>.<nonce>`.
+2. whoiam signs, with the persona you pick, `"whoiam-connect-v1" ‖ persona ‖ len ‖ return_base ‖ len ‖ challenge ‖ ts`, where `return_base` is FreeTunes' address: *this app key may act for me in FreeTunes*. That is the **delegation**.
+3. Releases, directory entries, comments and comment removals are signed by the app key and carry the delegation. The contracts check it with [`whoiam-delegation`](https://github.com/scobru/freenames/tree/main/delegation) (a git dependency on the FreeNames repo), including that its path is the app path in the release parameters. The owner of a release and the author of a comment is the **persona**.
 
-### Linking a whoiam persona
+A new node or a lost one is just another sign-in. The release page shows the owner persona; the artist page (`#/a/<persona key>`) lists that persona's releases. Releases published before personas are not supported any more.
 
-[whoiam](https://github.com/skandragon/freenet-whoiam) keeps personas derived from one master seed. FreeTunes never asks for that seed or for a persona's key. It uses whoiam's own "sign in with whoiam" flow instead:
-
-1. On the Identity page the address of the official whoiam site on this node (contract `87upyDfYzYHVY1Ypu9knhGUGRdydz54FHrBB6Bp2VBTg`) is filled in; paste another whoiam address to use a custom one and press **Link a whoiam persona**. FreeTunes remembers a one-time challenge (`<nonce>.<your FreeTunes public key>`) in the delegate store and opens whoiam with `?connect=v1&challenge=...&return=<FreeTunes address>`.
-2. whoiam asks which persona to share and signs `"whoiam-connect-v1" || pk || len || return address || len || challenge || ts` with that persona's key, then brings you back.
-3. FreeTunes checks the challenge (one use), that the time is within 10 minutes, and the ed25519 signature. The challenge contains your FreeTunes key, so the persona is vouching for exactly this key.
-
-The proof is kept with the identity and added to the release metadata you publish. Anyone viewing a release verifies it themselves and, if it holds for the artist's key, shows a "whoiam ✓" badge with the persona's public key; the contract ignores the field. Replacing the identity invalidates the link, and unlinking removes it. The signature format is checked against whoiam's golden test vector (`npm test` in `ui/`).
-
-The delegate is optional: if it does not answer, the app falls back to `localStorage`, then to memory, and the Identity page warns that the browser cannot keep the key. The identity otherwise belongs to your node; a backup is how you use it elsewhere.
+Limits: delegations do not expire or get revoked yet (contracts have no clock), so whoever controls a node you signed in from can publish and comment as your persona in FreeTunes; and whoiam's sign-in is used for something it does not advertise (it shows "sign in to <origin>", not "authorize this key"). Switch to whoiam's own cross-app delegation when it exists.
 
 ## Stack
 
@@ -113,7 +105,7 @@ On a local dev node (no network latency):
 - **Reports are claims.** Nothing is hidden automatically: a person must read the queue and publish a blocklist. A determined spammer can still grind many ante identities (each costs 18 bits), and the reports contract keeps only the newest 2000.
 - The ante consent prompt belongs to the node's own interface. A headless dev node cannot show it (it answers with a "request user input" message), so the full report flow needs a normal Freenet node; the rest of the path (proof format, contract acceptance, rejection of tampered reports) is tested without it.
 - **Removing a release does not erase its audio.** Chunks are content-addressed and immutable: they stay on the network while nodes host them, and anyone who already has their addresses can fetch them. Removal only deletes the references (the track list) from the release and the directory.
-- Editing and removing need the identity the release was published with: use it on the node where you created it, or import a backup elsewhere.
+- Editing and removing need the whoiam persona the release was published with: sign in with it on any node.
 - Releases published before editing existed (an older release contract) cannot be edited or removed: the node refuses any update to them and the client only sees a timeout. The release page says so instead of offering the buttons; publish the release again to get an editable one.
 - The blocklist only hides a release from the directory. It cannot remove it from Freenet.
 
