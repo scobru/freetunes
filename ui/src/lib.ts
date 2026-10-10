@@ -283,24 +283,26 @@ export async function peekIdentity(): Promise<Identity | null> {
 /** The identity, or an error telling the user to sign in. For everything that signs. */
 export async function requireIdentity(): Promise<Identity> {
   const me = await peekIdentity();
-  if (!me) throw new Error("Sign in with whoiam first (Identity in the menu).");
+  if (!me) throw new Error("Sign in with Viso first (Identity in the menu).");
   return me;
 }
 
 export const signOut = () => storePut("session", "");
 
-/** The official whoiam web contract; any other whoiam site on this node can be used instead. */
-export const WHOIAM_KEY = "87upyDfYzYHVY1Ypu9knhGUGRdydz54FHrBB6Bp2VBTg";
-export const officialWhoiam = () => `${location.protocol}//${location.host}/v1/contract/web/${WHOIAM_KEY}/`;
+/** The official Viso web contract; any other Viso site on this node can be used instead. */
+export const VISO_KEY = "GzHy3jnEtj26EoGqMsBpoawcY378hK9kp91rTcNYiAac";
+export const WHOIAM_KEY = VISO_KEY;
+export const officialViso = () => `${location.protocol}//${location.host}/v1/contract/web/${VISO_KEY}/`;
+export const officialWhoiam = officialViso;
 const LINK_MAX_AGE_MS = 10 * 60 * 1000;
-/** Our own address without query or hash: whoiam binds its proof to it. */
+/** Our own address without query or hash: Viso binds its proof to it. */
 export const linkBase = () => `${location.protocol}//${location.host}${APP_PATH}`;
 
 /** Where to send the user to sign in. Remembers the one-time challenge in the delegate store. */
-export async function startSignIn(whoiamUrl: string): Promise<string> {
-  const u = new URL(whoiamUrl);
+export async function startSignIn(visoUrl: string): Promise<string> {
+  const u = new URL(visoUrl);
   if (u.host !== location.host || !/^\/v[12]\/contract\/web\/[^/]+\/?$/.test(u.pathname)) {
-    throw new Error("Paste the address of your whoiam site on this node (it starts with the same host as this page).");
+    throw new Error("Paste the address of your Viso site on this node (it starts with the same host as this page).");
   }
   const challenge = `wd1.${await appKey()}.${hex(crypto.getRandomValues(new Uint8Array(16)))}`;
   await storePut("signin-pending", challenge);
@@ -308,16 +310,16 @@ export async function startSignIn(whoiamUrl: string): Promise<string> {
   return `${u.origin}${u.pathname}?connect=v1&challenge=${challenge}&return=${encodeURIComponent(linkBase())}`;
 }
 
-/** Handle whoiam's callback: check challenge, freshness and signature, then keep the delegation. Returns the persona. */
+/** Handle Viso's callback: check challenge, freshness and signature, then keep the delegation. Returns the persona. */
 export async function finishSignIn(q: URLSearchParams): Promise<string> {
-  if (q.get("whoiam") === "denied") throw new Error("You chose not to share a persona.");
+  if (q.get("viso") === "denied" || q.get("whoiam") === "denied") throw new Error("You chose not to share a persona.");
   const pending = await storeGet("signin-pending");
   await storePut("signin-pending", ""); // one use: burn it whatever happens next
   const persona = q.get("pk") ?? "";
   const cert: Cert = { base: linkBase(), challenge: q.get("challenge") ?? "", ts: Number(q.get("ts")), sig: q.get("sig") ?? "" };
   if (!pending || cert.challenge !== pending) throw new Error("This sign-in is unknown or was already used. Start again from the Identity page.");
   if (!Number.isFinite(cert.ts) || Math.abs(Date.now() - cert.ts) > LINK_MAX_AGE_MS) throw new Error("The proof is too old or its clock is off. Start again.");
-  if (!(await verifyProof({ ...cert, pk: persona }))) throw new Error("whoiam's signature does not verify.");
+  if (!(await verifyProof({ ...cert, pk: persona }))) throw new Error("Viso signature does not verify.");
   await storePut("session", JSON.stringify({ persona, cert }));
   return persona;
 }

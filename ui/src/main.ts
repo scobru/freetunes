@@ -32,7 +32,7 @@ function route() {
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
   const h = location.hash;
   const q = new URLSearchParams(location.search);
-  if (q.has("whoiam")) return signInCallback(q);
+  if (q.has("viso") || q.has("whoiam")) return signInCallback(q);
   const here = h === "#/publish" ? "publish" : h === "#/identity" ? "identity" : h === "" || h === "#/" ? "explore" : "";
   document.querySelectorAll<HTMLElement>("[data-nav]").forEach((a) => a.toggleAttribute("aria-current", a.dataset.nav === here));
   window.scrollTo(0, 0);
@@ -518,9 +518,9 @@ async function releasePage(instance: string, params: string) {
   $("#refresh").onclick = (e) => { e.preventDefault(); void releasePage(instance, params); };
 
   // owner tools: only the artist's own key matches the first 32 bytes of the contract parameters
-  if (params.length > 96) { // the owner is a whoiam persona (releases from before personas carry no app path)
+  if (params.length > 96) { // the owner is a Viso persona (releases from before personas carry no app path)
     const p = params.slice(0, 64);
-    $(".chips").insertAdjacentHTML("beforeend", `<span class="chip hot" title="whoiam persona ${esc(personaName(p))}">whoiam ${esc(personaName(p).slice(0, 8))}\u2026</span>`);
+    $(".chips").insertAdjacentHTML("beforeend", `<span class="chip hot" title="Viso persona ${esc(personaName(p))}">Viso ${esc(personaName(p).slice(0, 8))}\u2026</span>`);
   }
   void meReady.then((id) => {
     if (id?.pk !== params.slice(0, 64)) return;
@@ -571,12 +571,12 @@ async function publishPage() {
     <h1>Publish a release</h1>
     <div class="card">
       <h2>First, sign in</h2>
-      <p class="muted">Your releases belong to your <b>whoiam</b> persona, which proves they are yours and lets you edit or remove them from any node.</p>
-      <div class="actions"><a class="btn primary" href="#/identity">Sign in with whoiam</a></div>
+      <p class="muted">Your releases belong to your <b>Viso</b> persona, which proves they are yours and lets you edit or remove them from any node.</p>
+      <div class="actions"><a class="btn primary" href="#/identity">Sign in with Viso</a></div>
     </div>`;
 }
 
-/** Sign in with a whoiam persona (once per node), set the artist name, sign out. */
+/** Sign in with a Viso persona (once per node), set the artist name, sign out. */
 async function identityPage() {
   app.innerHTML = `<h1>Identity</h1><div id="idbox"><p class="muted">Loading...</p></div>`;
   const box = $("#idbox");
@@ -586,16 +586,16 @@ async function identityPage() {
   if (!me) {
     const saved = (await storeGet("whoiam-url")) || officialWhoiam();
     box.innerHTML = `
-      <p class="muted">Your identity is your <b>whoiam</b> persona: the same one you use in other Freenet apps. Sign in once on this node: whoiam opens, you pick a persona, and it lets FreeTunes publish and comment on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
+      <p class="muted">Your identity is your <b>Viso</b> persona: the same one you use in other Freenet apps. Sign in once on this node: Viso opens, you pick a persona, and it lets FreeTunes publish and comment on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
       <div class="card">
-        <h2>Sign in with whoiam</h2>
-        <label class="field"><span>Address of your whoiam site <small class="muted">(official by default, or paste your own)</small></span><input id="wurl" value="${esc(saved)}" placeholder="${esc(officialWhoiam())}" spellcheck="false" /></label>
-        <div class="actions"><button id="wgo" class="primary" type="button">Sign in with whoiam</button><button id="wofficial" type="button">Use official</button><span id="wmsg" class="muted"></span></div>
+        <h2>Sign in with Viso</h2>
+        <label class="field"><span>Address of your Viso site <small class="muted">(official by default, or paste your own)</small></span><input id="wurl" value="${esc(saved)}" placeholder="${esc(officialWhoiam())}" spellcheck="false" /></label>
+        <div class="actions"><button id="wgo" class="primary" type="button">Sign in with Viso</button><button id="wofficial" type="button">Use official</button><span id="wmsg" class="muted"></span></div>
       </div>`;
     $("#wofficial").onclick = () => { $<HTMLInputElement>("#wurl").value = officialWhoiam(); };
     $("#wgo").onclick = async () => {
       try {
-        $("#wmsg").textContent = "Opening whoiam...";
+        $("#wmsg").textContent = "Opening Viso...";
         goTo(await startSignIn($<HTMLInputElement>("#wurl").value.trim()));
       } catch (e) { $("#wmsg").textContent = String((e as Error).message ?? e); }
     };
@@ -606,7 +606,7 @@ async function identityPage() {
   box.innerHTML = `
     <div class="card">
       <h2>Signed in</h2>
-      <p>whoiam persona <code title="${esc(me.pk)}">${esc(personaName(me.pk))}</code></p>
+      <p>Viso persona <code title="${esc(me.pk)}">${esc(personaName(me.pk))}</code></p>
       <label class="field"><span>Artist name</span><input id="name" maxlength="80" value="${esc(name)}" placeholder="Used as the default artist when you publish" /></label>
       <div class="actions"><button id="savename" type="button">Save name</button><a class="btn primary" href="#/publish">Publish a release</a><a class="btn" href="#/a/${esc(me.pk)}">Your artist page</a><span id="nmsg" class="muted"></span></div>
     </div>
@@ -622,17 +622,17 @@ async function identityPage() {
 /** Open another page of this node (or any URL outside the sandbox) the way the Freenet shell allows. */
 const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
 
-/** whoiam sent the user back here with its proof (or a refusal). */
+/** Viso sent the user back here with its proof (or a refusal). */
 async function signInCallback(q: URLSearchParams) {
-  app.innerHTML = `<h1>whoiam</h1><p class="muted">Checking the proof...</p>`;
+  app.innerHTML = `<h1>Viso</h1><p class="muted">Checking the proof...</p>`;
   let html: string;
   try {
-    html = `<div class="notice"><b>Signed in</b> as the whoiam persona <code>${esc(personaName(await finishSignIn(q)))}</code>.</div>`;
+    html = `<div class="notice"><b>Signed in</b> as the Viso persona <code>${esc(personaName(await finishSignIn(q)))}</code>.</div>`;
   } catch (e) {
     html = `<div class="notice"><b>Not signed in.</b> ${esc(String((e as Error).message ?? e))}</div>`;
   }
   history.replaceState(null, "", location.pathname + "#/identity"); // the query must not run twice
-  app.innerHTML = `<h1>whoiam</h1>${html}<div class="actions"><a class="btn primary" href="#/identity">Continue</a></div>`;
+  app.innerHTML = `<h1>Viso</h1>${html}<div class="actions"><a class="btn primary" href="#/identity">Continue</a></div>`;
 }
 
 // ---------------- admin: hide releases from the directory with the admin key (hash #/admin) ----------------
