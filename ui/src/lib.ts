@@ -359,6 +359,10 @@ export async function replaceIdentity(sk?: string): Promise<Identity> {
 export const verifyLink = async (l: WhoiamLink, identityPk: string) =>
   l.challenge.endsWith(`.${identityPk}`) && (await verifyProof(l));
 
+/** The official whoiam web contract; any other whoiam site on this node can be used instead. */
+export const WHOIAM_KEY = "87upyDfYzYHVY1Ypu9knhGUGRdydz54FHrBB6Bp2VBTg";
+export const officialWhoiam = () => `${location.protocol}//${location.host}/v1/contract/web/${WHOIAM_KEY}/`;
+
 const LINK_MAX_AGE_MS = 10 * 60 * 1000;
 /** Our own address without query or hash: whoiam binds its proof to it. */
 export const linkBase = () => `${location.protocol}//${location.host}${location.pathname}`;
