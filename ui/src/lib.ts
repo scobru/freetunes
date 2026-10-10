@@ -434,6 +434,22 @@ export const updateRelease = async (instance: string, params: string, meta: Omit
 export const deleteRelease = (instance: string, params: string, current: number) =>
   pushState(instance, params, { deleted: true }, current);
 
+/**
+ * Take down a release published before whoiam personas (parameters = old node key || salt), signed with that old
+ * key, which the identity delegate still holds as the app key. Releases from before editing existed refuse it.
+ */
+export async function takeDownOld(instance: string, params: string) {
+  const s = await keyStore();
+  if ((await s.pk()) !== params.slice(0, 64)) throw new Error("This node no longer has the key that published it.");
+  const meta_json = JSON.stringify({ deleted: true, ts: Math.max(Date.now(), (await loadRelease(instance, params)).meta.ts + 1) });
+  const sig = await s.sign(`ftr1|${params}|${meta_json}`);
+  try { await retrying(() => sendDelta(instance, { meta_json, sig })); }
+  catch (e) {
+    if (!/timeout/i.test(String(e))) throw e; // a refused update is never answered
+    throw new Error("The node refused it: this release was published before removal existed.");
+  }
+}
+
 /** Follow a release: `onRemoteChange` listeners run when its owner edits or removes it. */
 export async function watchRelease(instance: string) {
   await (await api()).subscribe(new SubscribeRequest(fullKey(instance)));

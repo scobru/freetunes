@@ -2,7 +2,7 @@ import "./style.css";
 import {
   APP_PATH_HEX, blockReleases, deleteRelease, finishSignIn, flushKnown, officialWhoiam, fmtTime, getChunk,
   isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
-  postComment, putChunk, removeComment, signOut, splitMp3, startSignIn, storeGet, storePut, Streamer, updateRelease,
+  postComment, putChunk, removeComment, signOut, takeDownOld, splitMp3, startSignIn, storeGet, storePut, Streamer, updateRelease,
   watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
 } from "./lib";
 
@@ -92,10 +92,23 @@ async function explore() {
     <div id="mine"></div>
     <h2>Latest releases</h2>
     <div id="list"><p class="muted">Loading... (the first visit on a node can take up to 30 s)</p></div>`;
-  void myReleases().then((mine) => {
-    if (!mine.length) return;
-    $("#mine").innerHTML = `<h2>Your releases</h2><div class="grid">${mine.map((r) => card(r.hash, idOfHash(r.hash), r.title, r.artist, r.cover)).join("")}</div>`;
+  void myReleases().then((all) => {
+    // releases from before whoiam personas have 48-byte parameters (96 hex): offer to take them down
+    const isOld = (r: Saved) => (r.hash.split(".")[1] ?? "").length === 96;
+    const mine = all.filter((r) => !isOld(r)), old = all.filter(isOld);
+    $("#mine").innerHTML = (mine.length ? `<h2>Your releases</h2><div class="grid">${mine.map((r) => card(r.hash, idOfHash(r.hash), r.title, r.artist, r.cover)).join("")}</div>` : "") +
+      (old.length ? `<h2>Old releases</h2><p class="muted"><small>Published before whoiam sign-in. Taking one down replaces it with a signed notice, as Remove release did; the audio chunks stay on Freenet.</small></p>
+        <ul class="old">${old.map((r) => `<li><a href="${esc(r.hash)}">${esc(r.title)}</a> <button type="button" class="danger" data-down="${esc(r.hash)}">Take down</button> <button type="button" data-forget="${esc(r.hash)}">Forget</button> <small class="muted" data-out="${esc(r.hash)}"></small></li>`).join("")}</ul>` : "");
     lazyCovers($("#mine"));
+    const out = (h: string) => app.querySelector<HTMLElement>(`[data-out="${CSS.escape(h)}"]`)!;
+    app.querySelectorAll<HTMLButtonElement>("[data-down]").forEach((b) => (b.onclick = async () => {
+      const h = b.dataset.down!, [inst, params] = h.slice(4).split(".");
+      if (!confirm("Take this release down? It cannot be undone.")) return;
+      b.disabled = true; out(h).textContent = "Taking down...";
+      try { await takeDownOld(inst, params); await forgetRelease(h); void explore(); }
+      catch (e) { out(h).textContent = String((e as Error).message ?? e); b.disabled = false; }
+    }));
+    app.querySelectorAll<HTMLButtonElement>("[data-forget]").forEach((b) => (b.onclick = async () => { await forgetRelease(b.dataset.forget!); void explore(); }));
   });
   try {
     // only releases of this app: an entry is checked against the app path in its own parameters
