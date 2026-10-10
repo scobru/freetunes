@@ -65,7 +65,7 @@ An identity is an ed25519 key kept by the identity delegate in your node. It is 
 
 [whoiam](https://github.com/skandragon/freenet-whoiam) keeps personas derived from one master seed. FreeTunes never asks for that seed or for a persona's key. It uses whoiam's own "sign in with whoiam" flow instead:
 
-1. On the Identity page you give the address of your whoiam site on this node and press **Link a whoiam persona**. FreeTunes remembers a one-time challenge (`<nonce>.<your FreeTunes public key>`) in the delegate store and opens whoiam with `?connect=v1&challenge=...&return=<FreeTunes address>`.
+1. On the Identity page the address of the official whoiam site on this node (contract `87upyDfYzYHVY1Ypu9knhGUGRdydz54FHrBB6Bp2VBTg`) is filled in; paste another whoiam address to use a custom one and press **Link a whoiam persona**. FreeTunes remembers a one-time challenge (`<nonce>.<your FreeTunes public key>`) in the delegate store and opens whoiam with `?connect=v1&challenge=...&return=<FreeTunes address>`.
 2. whoiam asks which persona to share and signs `"whoiam-connect-v1" || pk || len || return address || len || challenge || ts` with that persona's key, then brings you back.
 3. FreeTunes checks the challenge (one use), that the time is within 10 minutes, and the ed25519 signature. The challenge contains your FreeTunes key, so the persona is vouching for exactly this key.
 

@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  backupIsEncrypted, blockReleases, clearLink, createIdentity, currentLink, deleteRelease, finishLink, flushKnown, fmtTime, getChunk,
+  backupIsEncrypted, blockReleases, clearLink, createIdentity, currentLink, deleteRelease, finishLink, flushKnown, officialWhoiam, fmtTime, getChunk,
   isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeBackup, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
   postComment, putChunk, readBackup, removeComment, replaceIdentity, restoreBackup, splitMp3, startLink, storeGet, storePut, Streamer, updateRelease,
   verifyLink, watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
@@ -702,11 +702,12 @@ async function drawWhoiam(me: Identity) {
     $("#unlink").onclick = async () => { await clearLink(); await drawWhoiam(me); };
     return;
   }
-  const saved = (await storeGet("whoiam-url")) ?? "";
+  const saved = (await storeGet("whoiam-url")) || officialWhoiam();
   card.innerHTML = `<h2>whoiam</h2>
     <p class="muted">Prove that one of your <b>whoiam</b> personas stands behind this identity, without sharing any key or seed. whoiam opens, you choose a persona, and you come back here.</p>
-    <label class="field"><span>Address of your whoiam site</span><input id="wurl" value="${esc(saved)}" placeholder="${esc(`${location.protocol}//${location.host}/v1/contract/web/\u2026/`)}" spellcheck="false" /></label>
-    <div class="actions"><button id="wgo" class="primary" type="button">Link a whoiam persona</button><span id="wmsg" class="muted"></span></div>`;
+    <label class="field"><span>Address of your whoiam site <small class="muted">(official by default, or paste your own)</small></span><input id="wurl" value="${esc(saved)}" placeholder="${esc(officialWhoiam())}" spellcheck="false" /></label>
+    <div class="actions"><button id="wgo" class="primary" type="button">Link a whoiam persona</button><button id="wofficial" type="button">Use official</button><span id="wmsg" class="muted"></span></div>`;
+  $("#wofficial").onclick = () => { $<HTMLInputElement>("#wurl").value = officialWhoiam(); };
   $("#wgo").onclick = async () => {
     try {
       $("#wmsg").textContent = "Opening whoiam...";
