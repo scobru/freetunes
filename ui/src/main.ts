@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  APP_PATH_HEX, blockReleases, deleteRelease, finishSignIn, flushKnown, officialWhoiam, fmtTime, getChunk,
+  APP_PATH_HEX, blockReleases, deleteRelease, finishSignIn, flushKnown, officialViso, fmtTime, getChunk,
   isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
   postComment, putChunk, removeComment, signOut, takeDownOld, splitMp3, startSignIn, storeGet, storePut, Streamer, updateRelease,
   watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
@@ -97,7 +97,7 @@ async function explore() {
     const isOld = (r: Saved) => (r.hash.split(".")[1] ?? "").length === 96;
     const mine = all.filter((r) => !isOld(r)), old = all.filter(isOld);
     $("#mine").innerHTML = (mine.length ? `<h2>Your releases</h2><div class="grid">${mine.map((r) => card(r.hash, idOfHash(r.hash), r.title, r.artist, r.cover)).join("")}</div>` : "") +
-      (old.length ? `<h2>Old releases</h2><p class="muted"><small>Published before whoiam sign-in. Taking one down replaces it with a signed notice, as Remove release did; the audio chunks stay on Freenet.</small></p>
+      (old.length ? `<h2>Old releases</h2><p class="muted"><small>Published before Viso sign-in. Taking one down replaces it with a signed notice, as Remove release did; the audio chunks stay on Freenet.</small></p>
         <ul class="old">${old.map((r) => `<li><a href="${esc(r.hash)}">${esc(r.title)}</a> <button type="button" class="danger" data-down="${esc(r.hash)}">Take down</button> <button type="button" data-forget="${esc(r.hash)}">Forget</button> <small class="muted" data-out="${esc(r.hash)}"></small></li>`).join("")}</ul>` : "");
     lazyCovers($("#mine"));
     const out = (h: string) => app.querySelector<HTMLElement>(`[data-out="${CSS.escape(h)}"]`)!;
@@ -154,7 +154,7 @@ async function editPage(instance: string, params: string) {
   try {
     const rel = await loadRelease(instance, params);
     const me = await peekIdentity();
-    if (me?.pk !== params.slice(0, 64)) return void (app.innerHTML = `<div class="gone"><h1>Not your release</h1><p class="muted">Only the artist who published it can edit it, signed in with the same whoiam persona.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
+    if (me?.pk !== params.slice(0, 64)) return void (app.innerHTML = `<div class="gone"><h1>Not your release</h1><p class="muted">Only the artist who published it can edit it, signed in with the same Viso persona.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
     if (rel.meta.deleted) return void (app.innerHTML = `<div class="gone"><h1>Release removed</h1><a class="btn" href="#/">Back</a></div>`);
     if (rel.legacy) return void (app.innerHTML = `<div class="gone"><h1>Cannot edit this release</h1><p class="muted">It was published with an older version of FreeTunes, before editing existed. Publish it again to get a release you can edit.</p><a class="btn" href="#/r/${esc(instance)}.${esc(params)}">Back to the release</a></div>`);
     return releaseForm(rel);
@@ -584,15 +584,15 @@ async function identityPage() {
   try { me = await peekIdentity(); } catch (e) { box.innerHTML = `<p class="err">Could not read the identity: ${esc(String(e))}</p>`; return; }
 
   if (!me) {
-    const saved = (await storeGet("whoiam-url")) || officialWhoiam();
+    const saved = (await storeGet("viso-url")) || officialViso();
     box.innerHTML = `
       <p class="muted">Your identity is your <b>Viso</b> persona: the same one you use in other Freenet apps. Sign in once on this node: Viso opens, you pick a persona, and it lets FreeTunes publish and comment on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
       <div class="card">
         <h2>Sign in with Viso</h2>
-        <label class="field"><span>Address of your Viso site <small class="muted">(official by default, or paste your own)</small></span><input id="wurl" value="${esc(saved)}" placeholder="${esc(officialWhoiam())}" spellcheck="false" /></label>
+        <label class="field"><span>Address of your Viso site <small class="muted">(official by default, or paste your own)</small></span><input id="wurl" value="${esc(saved)}" placeholder="${esc(officialViso())}" spellcheck="false" /></label>
         <div class="actions"><button id="wgo" class="primary" type="button">Sign in with Viso</button><button id="wofficial" type="button">Use official</button><span id="wmsg" class="muted"></span></div>
       </div>`;
-    $("#wofficial").onclick = () => { $<HTMLInputElement>("#wurl").value = officialWhoiam(); };
+    $("#wofficial").onclick = () => { $<HTMLInputElement>("#wurl").value = officialViso(); };
     $("#wgo").onclick = async () => {
       try {
         $("#wmsg").textContent = "Opening Viso...";

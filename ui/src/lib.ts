@@ -306,6 +306,7 @@ export async function startSignIn(visoUrl: string): Promise<string> {
   }
   const challenge = `wd1.${await appKey()}.${hex(crypto.getRandomValues(new Uint8Array(16)))}`;
   await storePut("signin-pending", challenge);
+  await storePut("viso-url", u.origin + u.pathname);
   await storePut("whoiam-url", u.origin + u.pathname);
   return `${u.origin}${u.pathname}?connect=v1&challenge=${challenge}&return=${encodeURIComponent(linkBase())}`;
 }
