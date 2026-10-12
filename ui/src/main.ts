@@ -1,8 +1,8 @@
 import "./style.css";
 import {
-  APP_PATH_HEX, blockReleases, deleteRelease, finishSignIn, flushKnown, officialViso, fmtTime, getChunk,
+  APP_PATH_HEX, blockReleases, createLocalIdentity, deleteRelease, finishSignIn, flushKnown, officialViso, fmtTime, getChunk,
   isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
-  postComment, putChunk, removeComment, signOut, takeDownOld, splitMp3, startSignIn, storeGet, storePut, Streamer, updateRelease,
+  localIdentityKey, postComment, putChunk, removeComment, signOut, takeDownOld, splitMp3, startSignIn, storeGet, storePut, Streamer, updateRelease,
   watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
 } from "./lib";
 
@@ -584,6 +584,8 @@ async function identityPage() {
   try { me = await peekIdentity(); } catch (e) { box.innerHTML = `<p class="err">Could not read the identity: ${esc(String(e))}</p>`; return; }
 
   if (!me) {
+    const kept = await localIdentityKey(); // made here, but this node's app key changed: sign for it again
+    if (kept) { try { await createLocalIdentity(kept); return void (await identityPage()); } catch { /* show the choices */ } }
     const saved = (await storeGet("viso-url")) || officialViso();
     box.innerHTML = `
       <p class="muted">Your identity is your <b>Viso</b> persona: the same one you use in other Freenet apps. Sign in once on this node: Viso opens, you pick a persona, and it lets FreeTunes publish and comment on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
@@ -591,7 +593,19 @@ async function identityPage() {
         <h2>Sign in with Viso</h2>
         <label class="field"><span>Address of your Viso site <small class="muted">(official by default, or paste your own)</small></span><input id="wurl" value="${esc(saved)}" placeholder="${esc(officialViso())}" spellcheck="false" /></label>
         <div class="actions"><button id="wgo" class="primary" type="button">Sign in with Viso</button><button id="wofficial" type="button">Use official</button><span id="wmsg" class="muted"></span></div>
+      </div>
+      <div class="card">
+        <h2>Or create an identity here</h2>
+        <p class="muted">No Viso needed: FreeTunes makes a new key on this node. You get a key to back up, and pasting it here (in this or another Freenet app, on any node) brings the same identity back.</p>
+        <div class="actions"><button id="lnew" type="button">Create identity</button><span id="lmsg" class="muted"></span></div>
+        <label class="field"><span>Already have a key? Paste it</span><input id="lkey" type="password" spellcheck="false" autocomplete="off" placeholder="64 hexadecimal characters" /></label>
+        <div class="actions"><button id="limport" type="button">Use this key</button></div>
       </div>`;
+    const local = async (key?: string) => {
+      try { await createLocalIdentity(key); await identityPage(); } catch (e) { $("#lmsg").textContent = String((e as Error).message ?? e); }
+    };
+    $("#lnew").onclick = () => local();
+    $("#limport").onclick = () => local($<HTMLInputElement>("#lkey").value);
     $("#wofficial").onclick = () => { $<HTMLInputElement>("#wurl").value = officialViso(); };
     $("#wgo").onclick = async () => {
       try {
@@ -603,20 +617,39 @@ async function identityPage() {
   }
 
   const name = (await storeGet("artist")) ?? "";
+  const key = await localIdentityKey();
   box.innerHTML = `
     <div class="card">
       <h2>Signed in</h2>
-      <p>Viso persona <code title="${esc(me.pk)}">${esc(personaName(me.pk))}</code></p>
+      <p>${key ? "Identity" : "Viso persona"} <code title="${esc(me.pk)}">${esc(personaName(me.pk))}</code></p>
       <label class="field"><span>Artist name</span><input id="name" maxlength="80" value="${esc(name)}" placeholder="Used as the default artist when you publish" /></label>
       <div class="actions"><button id="savename" type="button">Save name</button><a class="btn primary" href="#/publish">Publish a release</a><a class="btn" href="#/a/${esc(me.pk)}">Your artist page</a><span id="nmsg" class="muted"></span></div>
     </div>
+    ${key ? `<div class="card">
+      <h2>Back up your key</h2>
+      <p class="muted">This identity was made here, so this key is the only way to get it back. Keep it secret: whoever has it can publish as you.</p>
+      <div class="actions"><button id="kshow" type="button">Show key</button><button id="kdl" type="button">Download key</button></div>
+      <p><code id="kval" hidden>${esc(key)}</code></p>
+    </div>` : ""}
     <div class="card">
       <h2>Sign out</h2>
       <p class="muted">This node forgets the sign-in. Your releases stay yours: sign in again, here or on another node, to edit them.</p>
       <div class="actions"><button id="out" type="button">Sign out</button></div>
     </div>`;
   $("#savename").onclick = async () => { await storePut("artist", $<HTMLInputElement>("#name").value.trim()); $("#nmsg").textContent = "Saved."; };
-  $("#out").onclick = async () => { await signOut(); await identityPage(); };
+  if (key) {
+    $("#kshow").onclick = () => { $("#kval").hidden = !$("#kval").hidden; };
+    $("#kdl").onclick = () => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([`FreeTunes identity key: keep it secret.\n${key}\n`], { type: "text/plain" }));
+      a.download = `identity-${personaName(me!.pk).slice(0, 8)}.txt`;
+      a.click();
+    };
+  }
+  $("#out").onclick = async () => {
+    if (key && !confirm("Signing out deletes the key from this node. Without your backup this identity is lost. Sign out?")) return;
+    await signOut(); await identityPage();
+  };
 }
 
 /** Open another page of this node (or any URL outside the sandbox) the way the Freenet shell allows. */
