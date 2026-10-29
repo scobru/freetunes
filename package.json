@@ -1,0 +1,19 @@
+{
+  "name": "freetunes",
+  "private": true,
+  "description": "Music on Freenet: build, test and publish scripts for the contracts and the site",
+  "scripts": {
+    "dev": "npm --prefix ui run dev",
+    "start": "npm --prefix ui run dev",
+    "build:ui": "npm --prefix ui run build",
+    "build:contract": "cargo build --release --target wasm32-unknown-unknown -p freetunes-chunk -p freetunes-release -p freetunes-directory -p freetunes-identity -p freetunes-comments -p freetunes-reports && node -e \"for (const n of ['chunk','release','directory','identity','comments','reports']) require('fs').copyFileSync('target/wasm32-unknown-unknown/release/freetunes_' + n + '.wasm', 'ui/src/' + n + '.wasm')\"",
+    "build": "npm run build:contract && npm run build:ui",
+    "freenet:build": "npm run build:ui",
+    "freenet:init": "fdev website init freetunes",
+    "freenet:publish": "npm run freenet:build && fdev website publish ui/dist --key freetunes",
+    "freenet:update": "npm run freenet:build && fdev website update ui/dist --key freetunes",
+    "test": "npm run test:ui && npm run test:contract",
+    "test:ui": "npm --prefix ui test",
+    "test:contract": "cargo test"
+  }
+}

@@ -138,12 +138,25 @@ On Windows, put `~/.cargo/bin` before any standalone Rust install in `PATH`, oth
 
 The admin public key is `DIRECTORY_ADMIN` in `ui/src/lib.ts`; the secret is not in the repo (`.secrets/` is ignored). The admin page is at `#/admin` (not linked anywhere): paste the secret and the release ids to hide. The same page lists the reports, grouped by release, with a button that adds a release to the blocklist box. Changing the admin key or the directory code creates a new, empty directory.
 
+### Scripts
+
+From the repository root (`package.json` there only holds scripts):
+
+| Command | What it does |
+| --- | --- |
+| `npm run build:contract` | builds the five contracts and the delegate for `wasm32-unknown-unknown` and copies them into `ui/src` |
+| `npm run build` | contracts, then the site (`ui/dist`) |
+| `npm test` | UI tests, then `cargo test` |
+| `npm run dev` | the UI dev server |
+| `npm run freenet:init` | once: creates the site's signing key (`fdev website init freetunes`) |
+| `npm run freenet:publish` | builds the site and publishes it with that key |
+| `npm run freenet:update` | builds the site and publishes a new version at the same address |
+
 ### Publishing the site
 
 ```bash
-cd ui && npm run build
-fdev website init freetunes
-fdev website publish dist --key freetunes     # later: fdev website update dist --key freetunes
+npm run freenet:init       # once
+npm run freenet:publish    # later: npm run freenet:update
 ```
 
 Back up the signing key file: without it the site can no longer be updated.

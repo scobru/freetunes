@@ -333,7 +333,7 @@ async function releasePage(instance: string, params: string, track = -1) {
   const total = m.tracks.reduce((n, t) => n + t.chunks.reduce((s, c) => s + c.ms, 0), 0);
   app.innerHTML = `
     <p><a href="#/">← All releases</a></p>
-    <section class="release">
+    <section class="release" style="--h:${hueOf(instance)}">
       ${art(instance, m.title, m.cover?.addr)}
       <div>
         <p class="eyebrow">Release</p>
