@@ -24,9 +24,10 @@ const RIGHTS_TEXT =
 const ICON_PLAY = `<svg class="play-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5v13l11-6.5z"/></svg>`;
 const ICON_CHAT = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2.5h12v8H8.5L5 13.5v-3H2z"/></svg>`;
 const ICON_FLAG = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h1.5V15H3zM5 2h8l-2 3 2 3H5z"/></svg>`;
+const ICON_LINK = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.5 9.5l3-3M7 4.5l1.5-1.5a2.5 2.5 0 013.5 3.5L10.5 8M9 11.5L7.5 13A2.5 2.5 0 014 9.5L5.5 8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`;
 const ICON_PAUSE = `<svg class="pause-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h3.5v13H3zM9.5 1.5H13v13H9.5z"/></svg>`;
 
-// route: #/ explore | #/publish | #/identity | #/r/<id>.<params> | #/edit/<id>.<params> | #/a/<owner key> artist | #/admin (not linked anywhere)
+// route: #/ explore | #/publish | #/identity | #/r/<id>.<params>[/<track index>] | #/edit/<id>.<params> | #/a/<owner key> artist | #/admin (not linked anywhere)
 function route() {
   // inside the Freenet container, keep the address bar in sync so the URL is shareable
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
@@ -41,9 +42,9 @@ function route() {
   if (h === "#/admin") return admin();
   const ar = h.match(/^#\/a\/([0-9a-f]{64})$/);
   if (ar) return artistPage(ar[1]);
-  const m = h.match(/^#\/(r|edit)\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96,})$/);
+  const m = h.match(/^#\/(r|edit)\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96,})(?:\/(\d+))?$/);
   if (m?.[1] === "edit") return editPage(m[2], m[3]);
-  return m ? releasePage(m[2], m[3]) : explore();
+  return m ? releasePage(m[2], m[3], m[4] ? Number(m[4]) : -1) : explore();
 }
 
 // ---------------- helpers ----------------
@@ -316,7 +317,8 @@ function releaseForm(existing?: Release) {
 }
 
 // ---------------- release page ----------------
-async function releasePage(instance: string, params: string) {
+/** `track`: a shared link to one track (its index), highlighted and ready to play; -1 for the whole release. */
+async function releasePage(instance: string, params: string, track = -1) {
   app.innerHTML = `<p class="muted">Loading...</p>`;
   let rel: Release;
   try { rel = await loadRelease(instance, params); }
@@ -355,9 +357,10 @@ async function releasePage(instance: string, params: string) {
         <small class="muted">${fmtTime(t.chunks.reduce((s, c) => s + c.ms, 0))}</small>
         <button type="button" class="cbtn" data-c="${i}" aria-expanded="false" aria-label="Comments on ${esc(t.title)}">${ICON_CHAT}<span class="cn"></span></button>
         <button type="button" class="cbtn rbtn" data-r="${i}" aria-expanded="false" aria-label="Report ${esc(t.title)}" title="Report this track">${ICON_FLAG}<span class="rn"></span></button>
+        <button type="button" class="cbtn lbtn" data-l="${i}" aria-label="Link to ${esc(t.title)}" title="Link to this track">${ICON_LINK}</button>
         <div class="cpanel" hidden></div><div class="rpanel" hidden></div></li>`).join("")}</ol>
     <div id="reports" class="notice" hidden></div>
-    <label class="field share"><span>Link to share</span><input readonly value="${esc(pageUrl(hash))}" onfocus="this.select()" /></label>
+    <label class="field share"><span id="share-what">Link to share</span><input id="share" readonly value="${esc(pageUrl(hash))}" onfocus="this.select()" /></label>
     <p class="notice">The artist declared having the right to publish this music. FreeTunes is an experiment and cannot verify that claim or erase a release.
       Think it is not theirs to publish? <a href="#" id="report-release">Report this release</a>.</p>
     <div class="rpanel" id="rel-rpanel" hidden></div>
@@ -378,6 +381,22 @@ async function releasePage(instance: string, params: string) {
     if (i === current) return void (audio.paused ? audio.play() : audio.pause());
     start(i);
   }));
+  // a track's link button puts the link to that track in the share box
+  const shareTrack = (i: number) => {
+    $("#share-what").textContent = `Link to “${m.tracks[i].title}”`;
+    $<HTMLInputElement>("#share").value = pageUrl(`${hash}/${i}`);
+  };
+  rows.forEach((li, i) => ($<HTMLButtonElement>(".lbtn", li).onclick = () => {
+    shareTrack(i);
+    $<HTMLInputElement>("#share").focus();
+  }));
+  // opened from a track link: that track is marked and in view; playback still needs a click (browsers block autoplay)
+  if (rows[track]) {
+    rows[track].classList.add("on");
+    rows[track].scrollIntoView({ block: "center" });
+    status.textContent = `Press ▶ to play “${m.tracks[track].title}”`;
+    shareTrack(track);
+  }
   audio.onplaying = () => rows[current]?.classList.add("playing");
   audio.onpause = () => rows[current]?.classList.remove("playing");
   audio.onended = () => { if (current + 1 < m.tracks.length) start(current + 1); };
@@ -510,7 +529,7 @@ async function releasePage(instance: string, params: string) {
 
   // any subscribed contract can notify us: look at what changed
   const off = onRemoteChange(async () => {
-    if (location.hash !== hash) return;
+    if (!location.hash.startsWith(hash)) return; // a track link is this page too
     try { if ((await loadRelease(instance, params)).meta.ts !== m.ts) $("#changed").hidden = false; } catch { /* keep the page as it is */ }
     if (m.comments) { try { await reloadComments(); } catch { /* keep the page as it is */ } }
   });
