@@ -167,3 +167,86 @@ button.link:hover:not(:disabled) { color: var(--danger); }
 @media (max-width: 640px) { .cpanel, .rpanel { padding-left: 0; } }
 
 .about p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
+
+/* ---- look: depth and motion over the plain layout above ---- */
+:root { --glow-1: color-mix(in srgb, var(--accent) 22%, transparent); --glow-2: color-mix(in srgb, var(--accent-2) 16%, transparent); }
+body {
+  background:
+    radial-gradient(60rem 30rem at 15% -10%, var(--glow-1), transparent 70%),
+    radial-gradient(50rem 28rem at 95% 0%, var(--glow-2), transparent 70%),
+    var(--bg);
+  background-attachment: fixed;
+}
+h1, h2 { font-weight: 800; letter-spacing: -.03em; }
+h2 { font-size: 1.35rem; }
+.banner { padding: 4px 12px; font-size: .75rem; }
+.top { background: color-mix(in srgb, var(--bg) 70%, transparent); }
+.logo svg { transition: transform .8s cubic-bezier(.2, .7, .2, 1); }
+.logo:hover svg { transform: rotate(200deg); }
+
+/* explore: a big headline with a spinning record beside it */
+.hero { position: relative; padding: 48px 0 28px; }
+.hero h1 { font-size: clamp(2.4rem, 7vw, 4.2rem); max-width: 12ch; background: linear-gradient(120deg, var(--fg) 30%, var(--accent) 75%, var(--accent-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hero::after {
+  content: ""; position: absolute; right: 0; top: 50%; width: clamp(140px, 24vw, 240px); aspect-ratio: 1; translate: 0 -50%; border-radius: 50%; z-index: -1;
+  background: radial-gradient(circle, var(--accent) 0 9%, #111 9.5% 12%, transparent 12.5%), repeating-radial-gradient(circle, #19171f 0 2px, #0f0e14 2px 4px);
+  box-shadow: 0 30px 60px rgba(0, 0, 0, .5), inset 0 0 0 2px rgba(255, 255, 255, .04);
+  animation: spin 14s linear infinite; opacity: .9;
+}
+@keyframes spin { to { rotate: 360deg; } }
+
+/* cover art: grooves on the placeholder, a play button on hover */
+.art { border-radius: 14px; }
+.art::before { content: ""; position: absolute; inset: 0; background: repeating-radial-gradient(circle at 50% 50%, rgba(255, 255, 255, .05) 0 1px, transparent 1px 6px), linear-gradient(160deg, rgba(255, 255, 255, .18), transparent 45%); pointer-events: none; z-index: 1; }
+.art.loaded::before { background: linear-gradient(160deg, rgba(255, 255, 255, .12), transparent 45%); }
+.rel .art { transition: transform .25s, box-shadow .25s; }
+.rel .art::after {
+  content: ""; position: absolute; right: 12px; bottom: 12px; width: 46px; height: 46px; border-radius: 50%; z-index: 2;
+  background: var(--grad) center / 100% no-repeat; box-shadow: 0 8px 20px rgba(0, 0, 0, .45);
+  -webkit-mask: radial-gradient(circle, #000 70%, transparent 71%); mask: radial-gradient(circle, #000 70%, transparent 71%);
+  opacity: 0; translate: 0 8px; transition: opacity .2s, translate .2s;
+}
+.rel:hover { transform: none; }
+.rel:hover .art { transform: translateY(-4px); box-shadow: 0 18px 40px rgba(0, 0, 0, .55); }
+.rel:hover .art::after { opacity: 1; translate: 0 0; }
+.rel b { margin-top: 2px; font-size: .98rem; }
+
+/* release page: a header tinted with the cover's colour */
+.release { position: relative; padding: 26px; border-radius: 22px; isolation: isolate; overflow: hidden; align-items: end;
+  background: linear-gradient(135deg, hsl(var(--h, 330) 70% 40% / .55), hsl(calc(var(--h, 330) + 45) 70% 25% / .25) 60%, transparent), var(--surface);
+  border: 1px solid color-mix(in srgb, var(--fg) 8%, transparent); }
+.release .art { box-shadow: 0 24px 50px rgba(0, 0, 0, .55); }
+.release h1 { font-size: clamp(2rem, 5.5vw, 3.4rem); }
+.release .chip { background: rgba(0, 0, 0, .25); border-color: rgba(255, 255, 255, .12); color: var(--fg); }
+.release .chip.hot { color: #fff; background: var(--grad); border-color: transparent; color: #1a0f14; }
+
+/* tracks: numbered rows without boxes, tools on hover */
+ol.tracks { counter-reset: t; border: 0; background: transparent; overflow: visible; }
+ol.tracks li { counter-increment: t; border: 0; border-radius: 12px; padding: 8px 12px; transition: background .15s; }
+ol.tracks li::before { content: counter(t); width: 1.4em; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; font-size: .9rem; }
+ol.tracks li.on::before { color: var(--accent); }
+ol.tracks li:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+ol.tracks li.on { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.play { width: 36px; height: 36px; background: transparent; }
+ol.tracks li:hover .play { background: var(--surface-2); }
+li.on .play, ol.tracks li.on:hover .play { background: var(--grad); }
+.cbtn { border-color: transparent; background: transparent; }
+.cbtn:hover:not(:disabled) { background: var(--surface-2); }
+@media (hover: hover) { ol.tracks li:not(:hover):not(.on) .cbtn:not([aria-expanded="true"]) .cn:empty { visibility: hidden; } ol.tracks li:not(:hover):not(.on) .cbtn:not([aria-expanded="true"]):has(.cn:empty), ol.tracks li:not(:hover):not(.on) .rbtn:has(.rn:empty), ol.tracks li:not(:hover):not(.on) .lbtn { opacity: 0; } }
+
+/* player: a "now playing" bar that stays on screen while you scroll the tracks */
+.card.player { position: sticky; bottom: 14px; z-index: 4; padding: 10px 14px; border-radius: 18px;
+  background: color-mix(in srgb, var(--surface) 82%, transparent); backdrop-filter: blur(14px); box-shadow: var(--shadow), 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent); }
+.card { border-radius: 18px; }
+
+@media (max-width: 640px) {
+  .top { padding: 10px 14px; }
+  .top nav { gap: 12px; }
+  .logo span { display: none; }
+  .hero::after { display: none; }
+  .release { padding: 18px; }
+}
+@media (prefers-color-scheme: light) {
+  .hero::after { opacity: .85; }
+  .release .chip { background: rgba(255, 255, 255, .5); border-color: rgba(0, 0, 0, .08); }
+}
