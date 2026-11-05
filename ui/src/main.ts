@@ -3,7 +3,7 @@ import {
   APP_PATH_HEX, blockReleases, createLocalIdentity, deleteRelease, finishSignIn, flushKnown, officialViso, fmtTime, getChunk,
   isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
   localIdentityKey, postComment, putChunk, removeComment, signOut, takeDownOld, splitMp3, startSignIn, storeGet, storePut, Streamer, updateRelease,
-  watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta,
+  watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta, type ReleaseMeta,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -27,19 +27,26 @@ const ICON_FLAG = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h1
 const ICON_LINK = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.5 9.5l3-3M7 4.5l1.5-1.5a2.5 2.5 0 013.5 3.5L10.5 8M9 11.5L7.5 13A2.5 2.5 0 014 9.5L5.5 8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`;
 const ICON_PAUSE = `<svg class="pause-ic" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h3.5v13H3zM9.5 1.5H13v13H9.5z"/></svg>`;
 
-// route: #/ explore | #/publish | #/identity | #/r/<id>.<params>[/<track index>] | #/edit/<id>.<params> | #/a/<owner key> artist | #/admin (not linked anywhere)
+// ---------------- route ----------------
+// route: #/ explore | #/artists | #/search[/<query>] | #/publish | #/identity | #/r/<id>.<params>[/<track index>] | #/edit/<id>.<params> | #/a/<owner key> artist | #/admin
 function route() {
   // inside the Freenet container, keep the address bar in sync so the URL is shareable
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
   const h = location.hash;
   const q = new URLSearchParams(location.search);
   if (q.has("viso") || q.has("whoiam")) return signInCallback(q);
-  const here = h === "#/publish" ? "publish" : h === "#/identity" ? "identity" : h === "" || h === "#/" ? "explore" : "";
+  const here = h === "#/publish" ? "publish" : h === "#/identity" ? "identity" : h === "#/artists" ? "artists" : h === "" || h === "#/" ? "explore" : "";
   document.querySelectorAll<HTMLElement>("[data-nav]").forEach((a) => a.toggleAttribute("aria-current", a.dataset.nav === here));
   window.scrollTo(0, 0);
+
   if (h === "#/publish") return publishPage();
   if (h === "#/identity") return identityPage();
   if (h === "#/admin") return admin();
+  if (h === "#/artists") return artistsPage();
+  if (h.startsWith("#/search")) {
+    const raw = h.slice(8).replace(/^\/?(\?q=)?/, "");
+    return searchPage(decodeURIComponent(raw));
+  }
   const ar = h.match(/^#\/a\/([0-9a-f]{64})$/);
   if (ar) return artistPage(ar[1]);
   const m = h.match(/^#\/(r|edit)\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96,})(?:\/(\d+))?$/);
@@ -75,6 +82,46 @@ function lazyCovers(root: ParentNode) {
 const card = (hash: string, id: string, title: string, artist: string, cover?: string, extra = "") =>
   `<a class="rel" href="${esc(hash)}">${art(id, title, cover)}<b>${esc(title)}</b><small>${esc(artist)}${extra}</small></a>`;
 
+// ---------------- track caching & indexing for instant search ----------------
+interface CachedTrack {
+  albumId: string;
+  albumParams: string;
+  albumTitle: string;
+  artist: string;
+  cover?: string;
+  trackIndex: number;
+  trackTitle: string;
+  durationMs: number;
+}
+
+let trackCache: CachedTrack[] = [];
+try {
+  trackCache = JSON.parse(localStorage.getItem("ft-track-cache") || "[]");
+} catch {}
+
+function saveTrackCache(tracks: CachedTrack[]) {
+  const map = new Map<string, CachedTrack>();
+  for (const t of trackCache) map.set(`${t.albumId}:${t.trackIndex}`, t);
+  for (const t of tracks) map.set(`${t.albumId}:${t.trackIndex}`, t);
+  trackCache = Array.from(map.values()).slice(-2500);
+  try { localStorage.setItem("ft-track-cache", JSON.stringify(trackCache)); } catch {}
+}
+
+function indexReleaseTracks(instance: string, params: string, meta: ReleaseMeta) {
+  if (!meta.tracks) return;
+  const list: CachedTrack[] = meta.tracks.map((t, i) => ({
+    albumId: instance,
+    albumParams: params,
+    albumTitle: meta.title,
+    artist: meta.artist,
+    cover: meta.cover?.addr,
+    trackIndex: i,
+    trackTitle: t.title,
+    durationMs: t.chunks.reduce((s, c) => s + c.ms, 0),
+  }));
+  saveTrackCache(list);
+}
+
 // ---------------- my releases (kept by the identity delegate, or localStorage as a fallback) ----------------
 type Saved = { title: string; artist: string; hash: string; cover?: string };
 const myReleases = async (): Promise<Saved[]> => { try { return JSON.parse((await storeGet("releases")) ?? "[]"); } catch { return []; } };
@@ -82,19 +129,135 @@ const saveRelease = async (r: Saved) => storePut("releases", JSON.stringify([r, 
 const forgetRelease = async (hash: string) => storePut("releases", JSON.stringify((await myReleases()).filter((x) => x.hash !== hash)));
 const idOfHash = (hash: string) => hash.split("/")[2]?.split(".")[0] ?? hash;
 
+// ---------------- search catalog logic ----------------
+async function searchCatalog(query: string) {
+  const q = query.trim().toLowerCase();
+  const dir = await loadDirectory().catch(() => ({ entries: {}, blocked: { ts: 0, list: [], sig: "" } }));
+  const rows = Object.entries(dir.entries).filter(([, e]) => !e.removed && e.params.slice(96) === APP_PATH_HEX);
+
+  // Group by artist
+  const artistMap = new Map<string, { pk: string; name: string; releases: typeof rows; latestCover?: string; latestTs: number }>();
+  for (const [id, e] of rows) {
+    const pk = e.params.slice(0, 64);
+    const ex = artistMap.get(pk);
+    if (!ex) {
+      artistMap.set(pk, { pk, name: e.artist, releases: [[id, e]], latestCover: e.cover, latestTs: e.ts });
+    } else {
+      ex.releases.push([id, e]);
+      if (e.ts > ex.latestTs) { ex.latestTs = e.ts; ex.name = e.artist; if (e.cover) ex.latestCover = e.cover; }
+    }
+  }
+
+  const artists = q ? Array.from(artistMap.values()).filter((a) => a.name.toLowerCase().includes(q) || a.pk.startsWith(q)) : Array.from(artistMap.values());
+  const albums = q ? rows.filter(([, e]) => e.title.toLowerCase().includes(q) || e.artist.toLowerCase().includes(q)) : rows;
+  const tracks = q ? trackCache.filter((t) => t.trackTitle.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q) || t.albumTitle.toLowerCase().includes(q)) : trackCache;
+
+  return { artists, albums, tracks, allRows: rows };
+}
+
+// ---------------- header search bar ----------------
+function initHeaderSearch() {
+  const form = document.getElementById("header-search-form") as HTMLFormElement | null;
+  const input = document.getElementById("header-search-input") as HTMLInputElement | null;
+  const quick = document.getElementById("search-quick-results") as HTMLElement | null;
+  if (!form || !input || !quick) return;
+
+  const closeQuick = () => { quick.hidden = true; quick.innerHTML = ""; };
+
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const q = input.value.trim();
+    if (q) {
+      closeQuick();
+      location.hash = `#/search/${encodeURIComponent(q)}`;
+    }
+  };
+
+  let debounceTimer: ReturnType<typeof setTimeout>;
+  input.oninput = () => {
+    clearTimeout(debounceTimer);
+    const q = input.value.trim();
+    if (!q) return closeQuick();
+    debounceTimer = setTimeout(async () => {
+      try {
+        const { artists, albums, tracks } = await searchCatalog(q);
+        if (!input.value.trim()) return closeQuick();
+        if (!artists.length && !albums.length && !tracks.length) {
+          quick.innerHTML = `<div class="quick-empty">No results for “${esc(q)}”. <a href="#/search/${encodeURIComponent(q)}">Open full search</a></div>`;
+          quick.hidden = false;
+          return;
+        }
+        quick.innerHTML = `
+          ${artists.length ? `
+            <div class="quick-section">
+              <span class="quick-label">Artists</span>
+              ${artists.slice(0, 3).map((a) => `
+                <a class="quick-item" href="#/a/${esc(a.pk)}">
+                  <span class="quick-dot">●</span>
+                  <b>${esc(a.name)}</b>
+                  <small class="muted">${a.releases.length} rel</small>
+                </a>
+              `).join("")}
+            </div>
+          ` : ""}
+          ${albums.length ? `
+            <div class="quick-section">
+              <span class="quick-label">Albums</span>
+              ${albums.slice(0, 3).map(([id, e]) => `
+                <a class="quick-item" href="#/r/${id}.${e.params}">
+                  <span class="quick-dot">💿</span>
+                  <b>${esc(e.title)}</b>
+                  <small class="muted">by ${esc(e.artist)}</small>
+                </a>
+              `).join("")}
+            </div>
+          ` : ""}
+          ${tracks.length ? `
+            <div class="quick-section">
+              <span class="quick-label">Songs</span>
+              ${tracks.slice(0, 3).map((t) => `
+                <a class="quick-item" href="#/r/${t.albumId}.${t.albumParams}/${t.trackIndex}">
+                  <span class="quick-dot">▶</span>
+                  <b>${esc(t.trackTitle)}</b>
+                  <small class="muted">${esc(t.artist)}</small>
+                </a>
+              `).join("")}
+            </div>
+          ` : ""}
+          <a class="quick-all" href="#/search/${encodeURIComponent(q)}">See all results for “${esc(q)}” →</a>
+        `;
+        quick.hidden = false;
+      } catch {}
+    }, 180);
+  };
+
+  document.addEventListener("click", (e) => {
+    if (!form.contains(e.target as Node) && !quick.contains(e.target as Node)) {
+      closeQuick();
+    }
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeQuick();
+  });
+}
+
 // ---------------- explore ----------------
 async function explore() {
   app.innerHTML = `
     <section class="hero">
       <h1>Music on Freenet.</h1>
-      <p>Publish a release, share the link, and anyone can stream it. No accounts, no servers, no payments.</p>
-      <a class="btn primary" href="#/publish">Publish a release</a>
+      <p>Discover, stream, and publish music with no servers and no middleman. Pure peer-to-peer music in Bandcamp style.</p>
+      <div class="hero-actions">
+        <a class="btn primary" href="#/publish">Publish a release</a>
+        <a class="btn" href="#/artists">Browse artists</a>
+      </div>
     </section>
     <div id="mine"></div>
     <h2>Latest releases</h2>
     <div id="list"><p class="muted">Loading... (the first visit on a node can take up to 30 s)</p></div>`;
+
   void myReleases().then((all) => {
-    // releases from before whoiam personas have 48-byte parameters (96 hex): offer to take them down
     const isOld = (r: Saved) => (r.hash.split(".")[1] ?? "").length === 96;
     const mine = all.filter((r) => !isOld(r)), old = all.filter(isOld);
     $("#mine").innerHTML = (mine.length ? `<h2>Your releases</h2><div class="grid">${mine.map((r) => card(r.hash, idOfHash(r.hash), r.title, r.artist, r.cover)).join("")}</div>` : "") +
@@ -111,8 +274,8 @@ async function explore() {
     }));
     app.querySelectorAll<HTMLButtonElement>("[data-forget]").forEach((b) => (b.onclick = async () => { await forgetRelease(b.dataset.forget!); void explore(); }));
   });
+
   try {
-    // only releases of this app: an entry is checked against the app path in its own parameters
     const rows = Object.entries((await loadDirectory()).entries).filter(([, e]) => !e.removed && e.params.slice(96) === APP_PATH_HEX).sort(([, a], [, b]) => b.ts - a.ts);
     $("#list").innerHTML = rows.length
       ? `<div class="grid">${rows.map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover, ` · ${new Date(e.ts).toLocaleDateString()}`)).join("")}</div>`
@@ -121,23 +284,284 @@ async function explore() {
   } catch (e) { $("#list").innerHTML = `<p class="err">Could not load the directory: ${esc(String(e))}</p>`; }
 }
 
-// ---------------- artist page: the directory entries signed by one key ----------------
+// ---------------- artists directory tab (#/artists) ----------------
+async function artistsPage() {
+  app.innerHTML = `
+    <div class="bc-section-header">
+      <div>
+        <p class="eyebrow">Catalog</p>
+        <h1>All Artists</h1>
+        <p class="muted">Musicians, bands, and sound creators publishing on FreeTunes.</p>
+      </div>
+      <div class="artists-controls">
+        <input type="search" id="artist-filter" placeholder="Filter artists by name..." autocomplete="off" />
+      </div>
+    </div>
+    <div id="artists-list"><p class="muted">Loading artists from directory...</p></div>`;
+
+  try {
+    const dir = await loadDirectory();
+    const rows = Object.entries(dir.entries).filter(([, e]) => !e.removed && e.params.slice(96) === APP_PATH_HEX);
+
+    const artists = new Map<string, {
+      pk: string;
+      name: string;
+      releases: { id: string; params: string; title: string; cover?: string; ts: number }[];
+      latestTs: number;
+      latestCover?: string;
+    }>();
+
+    for (const [id, e] of rows) {
+      const pk = e.params.slice(0, 64);
+      let a = artists.get(pk);
+      if (!a) {
+        a = { pk, name: e.artist, releases: [], latestTs: e.ts, latestCover: e.cover };
+        artists.set(pk, a);
+      }
+      a.releases.push({ id, params: e.params, title: e.title, cover: e.cover, ts: e.ts });
+      if (e.ts > a.latestTs) {
+        a.latestTs = e.ts;
+        a.name = e.artist;
+        if (e.cover) a.latestCover = e.cover;
+      }
+    }
+
+    const artistList = Array.from(artists.values()).sort((a, b) => b.releases.length - a.releases.length || b.latestTs - a.latestTs);
+
+    const render = (filter = "") => {
+      const f = filter.toLowerCase().trim();
+      const filtered = artistList.filter((a) => a.name.toLowerCase().includes(f) || a.pk.startsWith(f));
+      const box = $("#artists-list");
+      if (!filtered.length) {
+        box.innerHTML = `<div class="empty">No artists found${f ? ` matching “${esc(filter)}”` : ""}.</div>`;
+        return;
+      }
+      box.innerHTML = `
+        <div class="artists-grid">
+          ${filtered.map((a) => `
+            <a class="artist-card card" href="#/a/${esc(a.pk)}">
+              <div class="artist-card-top">
+                <div class="artist-avatar" style="--h:${hueOf(a.pk)}">
+                  ${a.latestCover ? `<img data-cover="${esc(a.latestCover)}" alt="" />` : ""}
+                  <span>${esc((a.name.trim()[0] ?? "A").toUpperCase())}</span>
+                </div>
+                <div class="artist-card-info">
+                  <h3 class="artist-card-name">${esc(a.name)}</h3>
+                  <div class="chips">
+                    <span class="chip hot">${a.releases.length} release${a.releases.length === 1 ? "" : "s"}</span>
+                    <span class="chip" title="${esc(a.pk)}">key ${esc(a.pk.slice(0, 8))}…</span>
+                  </div>
+                </div>
+              </div>
+              ${a.releases.length ? `
+                <div class="artist-card-disco">
+                  ${a.releases.slice(0, 4).map((r) => `
+                    <div class="artist-disco-thumb" title="${esc(r.title)}">
+                      ${art(r.id, r.title, r.cover, "mini-art")}
+                    </div>
+                  `).join("")}
+                </div>
+              ` : ""}
+            </a>
+          `).join("")}
+        </div>`;
+      lazyCovers(box);
+    };
+
+    render();
+    const filterInput = $<HTMLInputElement>("#artist-filter");
+    if (filterInput) filterInput.oninput = () => render(filterInput.value);
+  } catch (e) {
+    $("#artists-list").innerHTML = `<p class="err">Could not load artists: ${esc(String(e))}</p>`;
+  }
+}
+
+// ---------------- search page (#/search[/<query>]) ----------------
+async function searchPage(initialQuery = "") {
+  app.innerHTML = `
+    <div class="bc-search-page">
+      <div class="search-hero">
+        <p class="eyebrow">Search</p>
+        <h1>Search Catalog</h1>
+        <p class="muted">Find artists, releases, and individual songs on FreeTunes.</p>
+        <div class="search-input-wrap">
+          <svg class="search-ic" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z" fill="currentColor"/>
+          </svg>
+          <input id="search-main-input" type="search" placeholder="Type artist name, album, or song title..." value="${esc(initialQuery)}" autofocus />
+          <button id="search-clear-btn" type="button" class="search-clear-btn" ${initialQuery ? "" : "hidden"}>✕</button>
+        </div>
+      </div>
+      <div class="search-tabs">
+        <button type="button" class="search-tab on" data-tab="all">All</button>
+        <button type="button" class="search-tab" data-tab="artists">Artists <span id="cnt-artists" class="tab-count"></span></button>
+        <button type="button" class="search-tab" data-tab="albums">Albums <span id="cnt-albums" class="tab-count"></span></button>
+        <button type="button" class="search-tab" data-tab="tracks">Songs <span id="cnt-tracks" class="tab-count"></span></button>
+      </div>
+      <div id="search-results"><p class="muted">Loading search data...</p></div>
+    </div>`;
+
+  let currentTab = "all";
+  const searchInput = $<HTMLInputElement>("#search-main-input");
+  const clearBtn = $<HTMLButtonElement>("#search-clear-btn");
+  const resultsBox = $("#search-results");
+
+  const runSearch = async () => {
+    const q = searchInput.value.trim();
+    clearBtn.hidden = !q;
+    const { artists, albums, tracks, allRows } = await searchCatalog(q);
+
+    $<HTMLElement>("#cnt-artists").textContent = `(${artists.length})`;
+    $<HTMLElement>("#cnt-albums").textContent = `(${albums.length})`;
+    $<HTMLElement>("#cnt-tracks").textContent = `(${tracks.length})`;
+
+    if (!q) {
+      resultsBox.innerHTML = `
+        <div class="empty">Type a song, artist, or album name above to search across FreeTunes.</div>
+        <h3 class="search-group-title">Browse all albums (${allRows.length})</h3>
+        <div class="grid">${allRows.slice(0, 18).map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover)).join("")}</div>`;
+      lazyCovers(resultsBox);
+      return;
+    }
+
+    if (!artists.length && !albums.length && !tracks.length) {
+      resultsBox.innerHTML = `<div class="empty">No artists, albums, or songs matching “${esc(q)}”.</div>`;
+      return;
+    }
+
+    let html = "";
+
+    // Artists section
+    if ((currentTab === "all" || currentTab === "artists") && artists.length) {
+      html += `
+        <h3 class="search-group-title">Artists <span class="search-group-count">(${artists.length})</span></h3>
+        <div class="artists-grid">
+          ${artists.map((a) => `
+            <a class="artist-card card" href="#/a/${esc(a.pk)}">
+              <div class="artist-card-top">
+                <div class="artist-avatar" style="--h:${hueOf(a.pk)}">
+                  ${a.latestCover ? `<img data-cover="${esc(a.latestCover)}" alt="" />` : ""}
+                  <span>${esc((a.name.trim()[0] ?? "A").toUpperCase())}</span>
+                </div>
+                <div class="artist-card-info">
+                  <h3 class="artist-card-name">${esc(a.name)}</h3>
+                  <div class="chips"><span class="chip hot">${a.releases.length} release${a.releases.length === 1 ? "" : "s"}</span></div>
+                </div>
+              </div>
+            </a>
+          `).join("")}
+        </div>`;
+    }
+
+    // Songs section
+    if ((currentTab === "all" || currentTab === "tracks") && tracks.length) {
+      html += `
+        <h3 class="search-group-title">Songs <span class="search-group-count">(${tracks.length})</span></h3>
+        <ul class="track-results-list">
+          ${tracks.map((t) => `
+            <li class="track-result-item">
+              <a class="track-result-play" href="#/r/${t.albumId}.${t.albumParams}/${t.trackIndex}" title="Play ${esc(t.trackTitle)}">
+                ${ICON_PLAY}
+              </a>
+              <div class="track-result-info">
+                <a class="track-result-title" href="#/r/${t.albumId}.${t.albumParams}/${t.trackIndex}">${esc(t.trackTitle)}</a>
+                <span class="track-result-meta">
+                  from <a href="#/r/${t.albumId}.${t.albumParams}">${esc(t.albumTitle)}</a> by <b>${esc(t.artist)}</b>
+                </span>
+              </div>
+              <span class="track-result-time">${fmtTime(t.durationMs)}</span>
+            </li>
+          `).join("")}
+        </ul>`;
+    }
+
+    // Albums section
+    if ((currentTab === "all" || currentTab === "albums") && albums.length) {
+      html += `
+        <h3 class="search-group-title">Albums <span class="search-group-count">(${albums.length})</span></h3>
+        <div class="grid">
+          ${albums.map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover, ` · ${new Date(e.ts).toLocaleDateString()}`)).join("")}
+        </div>`;
+    }
+
+    resultsBox.innerHTML = html;
+    lazyCovers(resultsBox);
+  };
+
+  // Progressive background track indexer for unindexed directory releases
+  void loadDirectory().then(async (dir) => {
+    const unindexed = Object.entries(dir.entries)
+      .filter(([id, e]) => !e.removed && e.params.slice(96) === APP_PATH_HEX && !trackCache.some((t) => t.albumId === id))
+      .slice(0, 10);
+    for (const [id, e] of unindexed) {
+      try {
+        const rel = await loadRelease(id, e.params);
+        indexReleaseTracks(id, e.params, rel.meta);
+        if (searchInput.value.trim()) void runSearch();
+      } catch {}
+    }
+  }).catch(() => {});
+
+  app.querySelectorAll<HTMLButtonElement>(".search-tab").forEach((btn) => {
+    btn.onclick = () => {
+      app.querySelectorAll(".search-tab").forEach((b) => b.classList.remove("on"));
+      btn.classList.add("on");
+      currentTab = btn.dataset.tab!;
+      void runSearch();
+    };
+  });
+
+  let debounceTimer: ReturnType<typeof setTimeout>;
+  searchInput.oninput = () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      const q = searchInput.value.trim();
+      history.replaceState(null, "", pageUrl(q ? `#/search/${encodeURIComponent(q)}` : "#/search"));
+      void runSearch();
+    }, 150);
+  };
+
+  clearBtn.onclick = () => {
+    searchInput.value = "";
+    searchInput.focus();
+    history.replaceState(null, "", pageUrl("#/search"));
+    void runSearch();
+  };
+
+  void runSearch();
+}
+
+// ---------------- artist page: directory entries signed by one key ----------------
 async function artistPage(pk: string) {
   app.innerHTML = `<p class="muted">Loading... (the first visit on a node can take up to 30 s)</p>`;
   try {
     const [dir, me] = await Promise.all([loadDirectory(), peekIdentity()]);
     const rows = Object.entries(dir.entries).filter(([, e]) => e.params.slice(0, 64) === pk && !e.removed && e.params.slice(96) === APP_PATH_HEX).sort(([, a], [, b]) => b.ts - a.ts);
     const yours = me?.pk === pk;
-    // your own releases that are not in the directory (private links) show up on your page too
     const listed = new Set(rows.map(([id]) => id));
     const unlisted = yours ? (await myReleases()).filter((r) => !listed.has(idOfHash(r.hash))) : [];
     const name = rows[0]?.[1].artist ?? unlisted[0]?.artist ?? "Unknown artist";
+
     app.innerHTML = `
-      <p><a href="#/">← All releases</a></p>
-      <p class="eyebrow">Artist</p>
-      <h1>${esc(name)}</h1>
-      <div class="chips"><span class="chip">${rows.length + unlisted.length} release${rows.length + unlisted.length === 1 ? "" : "s"}</span>
-        <span class="chip" title="${esc(pk)}">key ${esc(pk.slice(0, 8))}…</span>${yours ? `<span class="chip hot">you</span>` : ""}</div>
+      <p><a href="#/artists">← All artists</a></p>
+      <div class="bc-section-header">
+        <div style="display:flex; align-items:center; gap:16px;">
+          <div class="artist-avatar" style="--h:${hueOf(pk)}; width:70px; height:70px; font-size:1.8rem;">
+            ${rows[0]?.[1].cover ? `<img data-cover="${esc(rows[0][1].cover)}" alt="" />` : ""}
+            <span>${esc((name.trim()[0] ?? "A").toUpperCase())}</span>
+          </div>
+          <div>
+            <p class="eyebrow">Artist</p>
+            <h1 style="margin-bottom:4px;">${esc(name)}</h1>
+            <div class="chips">
+              <span class="chip hot">${rows.length + unlisted.length} release${rows.length + unlisted.length === 1 ? "" : "s"}</span>
+              <span class="chip" title="${esc(pk)}">key ${esc(pk.slice(0, 8))}…</span>
+              ${yours ? `<span class="chip hot">you</span>` : ""}
+            </div>
+          </div>
+        </div>
+      </div>
+      <h2>Releases</h2>
       ${rows.length + unlisted.length ? `<div class="grid">${rows.map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover, ` · ${new Date(e.ts).toLocaleDateString()}`)).join("")}${unlisted.map((r) => card(r.hash, idOfHash(r.hash), r.title, r.artist, r.cover, " · not listed")).join("")}</div>`
         : `<div class="empty">No releases listed in the directory for this artist.</div>`}
       <label class="field share"><span>Link to share</span><input readonly value="${esc(pageUrl(`#/a/${pk}`))}" onfocus="this.select()" /></label>
@@ -213,7 +637,7 @@ function releaseForm(existing?: Release) {
     <progress id="bar" max="100" value="0" hidden></progress>`;
 
   if (!edit) void storeGet("artist").then((a) => { if (a && !$<HTMLInputElement>("#artist").value) $<HTMLInputElement>("#artist").value = a; });
-  if (existing) { // show the "update directory" option only if the release is listed
+  if (existing) {
     void loadDirectory().then((d) => { const e = d.entries[existing.instance]; if (e && !e.removed) $("#list-row").hidden = false; }).catch(() => {});
   }
   lazyCovers($("#prev"));
@@ -299,6 +723,10 @@ function releaseForm(existing?: Release) {
         await updateRelease(existing.instance, existing.params, meta, existing.meta.ts);
         ({ instance, params } = existing);
       } else ({ instance, params } = await publishRelease(meta));
+
+      // Cache tracks immediately
+      indexReleaseTracks(instance, params, { ...meta, ts: Date.now() });
+
       const hash = `#/r/${instance}.${params}`;
       await saveRelease({ title, artist, hash, cover: cover?.addr });
       await storePut("artist", artist);
@@ -309,14 +737,14 @@ function releaseForm(existing?: Release) {
       }
       location.hash = hash;
     } catch (e) {
-      void flushKnown(); // keep what was already published, so a retry skips it
+      void flushKnown();
       msg.textContent = `Error: ${e}`;
       go.disabled = false;
     }
   };
 }
 
-// ---------------- release page ----------------
+// ---------------- release page in Bandcamp style ----------------
 /** `track`: a shared link to one track (its index), highlighted and ready to play; -1 for the whole release. */
 async function releasePage(instance: string, params: string, track = -1) {
   app.innerHTML = `<p class="muted">Loading...</p>`;
@@ -324,64 +752,215 @@ async function releasePage(instance: string, params: string, track = -1) {
   try { rel = await loadRelease(instance, params); }
   catch (e) { return void (app.innerHTML = `<p class="err">Could not load the release: ${esc(String(e))}</p><p><a href="#/">← Back</a></p>`); }
   const m = rel.meta, hash = `#/r/${instance}.${params}`;
-  void watchRelease(instance).catch(() => {}); // may not resolve in local mode; only the notification matters
+  indexReleaseTracks(instance, params, m);
+  void watchRelease(instance).catch(() => {});
 
   if (m.deleted) {
     void forgetRelease(hash);
     return void (app.innerHTML = `<div class="gone"><h1>Release removed</h1><p class="muted">The artist took this release down.</p><a class="btn" href="#/">Back to Explore</a></div>`);
   }
   const total = m.tracks.reduce((n, t) => n + t.chunks.reduce((s, c) => s + c.ms, 0), 0);
+  const initialTrackIdx = track >= 0 && track < m.tracks.length ? track : 0;
+  const initialTrack = m.tracks[initialTrackIdx];
+
   app.innerHTML = `
     <p><a href="#/">← All releases</a></p>
-    <section class="release" style="--h:${hueOf(instance)}">
-      ${art(instance, m.title, m.cover?.addr)}
-      <div>
-        <p class="eyebrow">Release</p>
-        <h1>${esc(m.title)}</h1>
-        <p class="by">by <a href="#/a/${esc(params.slice(0, 64))}"><b>${esc(m.artist)}</b></a></p>
-        <div class="chips">
+    <div class="bc-album-page" style="--h:${hueOf(instance)}">
+      <!-- MAIN / LEFT COLUMN -->
+      <div class="bc-main">
+        <div class="bc-album-header">
+          <h1 class="bc-title">${esc(m.title)}</h1>
+          <p class="bc-by">by <a href="#/a/${esc(params.slice(0, 64))}"><b>${esc(m.artist)}</b></a></p>
+        </div>
+
+        <!-- BANDCAMP EMBEDDED PLAYER -->
+        <div class="bc-player">
+          <div class="bc-player-row">
+            <button type="button" class="bc-big-play" id="big-play" aria-label="Play or pause release">
+              ${ICON_PLAY}${ICON_PAUSE}
+            </button>
+            <div class="bc-player-details">
+              <div class="bc-track-line">
+                <span class="bc-now-title" id="now-title">${esc(initialTrack?.title ?? m.title)}</span>
+                <span class="bc-now-time" id="now-time">0:00 / ${fmtTime(initialTrack ? initialTrack.chunks.reduce((s, c) => s + c.ms, 0) : total)}</span>
+              </div>
+              <div class="bc-seeker-wrap">
+                <input type="range" class="bc-seeker" id="bc-seeker" min="0" max="100" value="0" step="0.1" aria-label="Seek track" />
+              </div>
+              <div id="status" class="bc-status muted"></div>
+            </div>
+          </div>
+          <audio id="player" preload="none"></audio>
+        </div>
+
+        <!-- METADATA & BADGES -->
+        <div class="bc-meta-bar">
           <span class="chip hot">${esc(LICENSES[m.license] ?? m.license)}</span>
           <span class="chip">${m.tracks.length} track${m.tracks.length === 1 ? "" : "s"}</span>
           <span class="chip">${fmtTime(total)}</span>
           <span class="chip">${new Date(m.ts).toLocaleDateString()}</span>
         </div>
-        <div id="owner" class="owner-tools"></div>
+
+        <div id="changed" class="notice" hidden>The artist updated this release. <a href="#" id="refresh">Refresh</a></div>
+
+        <!-- TRACKLIST -->
+        <div class="bc-tracklist-wrap">
+          <h3 class="bc-subhead">Tracks</h3>
+          <ol class="tracks">${m.tracks.map((t, i) => `
+            <li data-i="${i}">
+              <button type="button" class="play" aria-label="Play ${esc(t.title)}">${ICON_PLAY}${ICON_PAUSE}</button>
+              <span class="tnum">${i + 1}.</span>
+              <span class="tt">${esc(t.title)}</span>
+              <span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>
+              <small class="muted">${fmtTime(t.chunks.reduce((s, c) => s + c.ms, 0))}</small>
+              <button type="button" class="cbtn" data-c="${i}" aria-expanded="false" aria-label="Comments on ${esc(t.title)}">${ICON_CHAT}<span class="cn"></span></button>
+              <button type="button" class="cbtn rbtn" data-r="${i}" aria-expanded="false" aria-label="Report ${esc(t.title)}" title="Report this track">${ICON_FLAG}<span class="rn"></span></button>
+              <button type="button" class="cbtn lbtn" data-l="${i}" aria-label="Link to ${esc(t.title)}" title="Link to this track">${ICON_LINK}</button>
+              <div class="cpanel" hidden></div>
+              <div class="rpanel" hidden></div>
+            </li>`).join("")}
+          </ol>
+        </div>
+
+        <!-- ABOUT / CREDITS -->
+        ${m.about ? `
+          <div class="bc-about-wrap">
+            <h3 class="bc-subhead">About this release</h3>
+            <div class="card about"><p>${esc(m.about)}</p></div>
+          </div>` : ""}
+
+        <div id="reports" class="notice" hidden></div>
       </div>
-    </section>
-    ${m.about ? `<div class="card about"><h2>About</h2><p>${esc(m.about)}</p></div>` : ""}
-    <div id="changed" class="notice" hidden>The artist updated this release. <a href="#" id="refresh">Refresh</a></div>
-    <div class="card player"><audio id="player" controls preload="none"></audio><p id="status" class="muted"></p></div>
-    <ol class="tracks">${m.tracks.map((t, i) => `
-      <li data-i="${i}"><button type="button" class="play" aria-label="Play ${esc(t.title)}">${ICON_PLAY}${ICON_PAUSE}</button>
-        <span class="tt">${esc(t.title)}</span><span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>
-        <small class="muted">${fmtTime(t.chunks.reduce((s, c) => s + c.ms, 0))}</small>
-        <button type="button" class="cbtn" data-c="${i}" aria-expanded="false" aria-label="Comments on ${esc(t.title)}">${ICON_CHAT}<span class="cn"></span></button>
-        <button type="button" class="cbtn rbtn" data-r="${i}" aria-expanded="false" aria-label="Report ${esc(t.title)}" title="Report this track">${ICON_FLAG}<span class="rn"></span></button>
-        <button type="button" class="cbtn lbtn" data-l="${i}" aria-label="Link to ${esc(t.title)}" title="Link to this track">${ICON_LINK}</button>
-        <div class="cpanel" hidden></div><div class="rpanel" hidden></div></li>`).join("")}</ol>
-    <div id="reports" class="notice" hidden></div>
-    <label class="field share"><span id="share-what">Link to share</span><input id="share" readonly value="${esc(pageUrl(hash))}" onfocus="this.select()" /></label>
-    <p class="notice">The artist declared having the right to publish this music. FreeTunes is an experiment and cannot verify that claim or erase a release.
-      Think it is not theirs to publish? <a href="#" id="report-release">Report this release</a>.</p>
-    <div class="rpanel" id="rel-rpanel" hidden></div>
+
+      <!-- RIGHT COLUMN: SIDEBAR -->
+      <aside class="bc-sidebar">
+        <div class="bc-art-container">
+          ${art(instance, m.title, m.cover?.addr, "bc-cover-art")}
+        </div>
+
+        <div class="card bc-artist-card">
+          <div class="bc-artist-header">
+            <div class="bc-artist-avatar" style="--h:${hueOf(params.slice(0, 64))}">
+              <span>${esc((m.artist.trim()[0] ?? "A").toUpperCase())}</span>
+            </div>
+            <div>
+              <p class="eyebrow" style="margin:0 0 2px;">Artist</p>
+              <h4 class="bc-artist-name"><a href="#/a/${esc(params.slice(0, 64))}">${esc(m.artist)}</a></h4>
+            </div>
+          </div>
+          <div class="chips">
+            <span class="chip" title="${esc(params.slice(0, 64))}">key ${esc(params.slice(0, 8))}…</span>
+            ${params.length > 96 ? `<span class="chip hot" title="Viso persona ${esc(personaName(params.slice(0, 64)))}">Viso ${esc(personaName(params.slice(0, 64)).slice(0, 8))}…</span>` : ""}
+          </div>
+
+          <!-- DISCOGRAPHY PREVIEW -->
+          <div id="bc-disco" class="bc-disco-section"></div>
+
+          <!-- SHARE BOX -->
+          <div class="bc-share-box">
+            <label class="field share">
+              <span id="share-what">Share this release</span>
+              <div class="share-row">
+                <input id="share" readonly value="${esc(pageUrl(hash))}" onfocus="this.select()" />
+                <button type="button" class="btn small" id="copy-btn">Copy</button>
+              </div>
+            </label>
+          </div>
+
+          <!-- OWNER TOOLS -->
+          <div id="owner" class="owner-tools"></div>
+        </div>
+
+        <div class="bc-report-link-wrap">
+          <a href="#" id="report-release" class="muted small link">Report release</a>
+          <div class="rpanel" id="rel-rpanel" hidden></div>
+        </div>
+      </aside>
+    </div>
     <div id="confirm"></div>`;
+
   lazyCovers(app);
 
-  const audio = $<HTMLAudioElement>("#player"), status = $("#status");
+  // Load other releases by this artist into sidebar discography
+  void loadDirectory().then((dir) => {
+    const pk = params.slice(0, 64);
+    const others = Object.entries(dir.entries)
+      .filter(([id, e]) => e.params.slice(0, 64) === pk && id !== instance && !e.removed && e.params.slice(96) === APP_PATH_HEX)
+      .sort(([, a], [, b]) => b.ts - a.ts);
+    const disco = $("#bc-disco");
+    if (!disco) return;
+    if (others.length) {
+      disco.innerHTML = `
+        <div class="bc-disco-title">Discography</div>
+        <div class="bc-disco-grid">
+          ${others.slice(0, 6).map(([id, e]) => `
+            <a class="bc-disco-item" href="#/r/${id}.${e.params}" title="${esc(e.title)}">
+              ${art(id, e.title, e.cover)}
+              <small>${esc(e.title)}</small>
+            </a>
+          `).join("")}
+        </div>`;
+      lazyCovers(disco);
+    }
+  }).catch(() => {});
+
+  const audio = $<HTMLAudioElement>("#player");
+  const status = $("#status");
+  const bigPlay = $<HTMLButtonElement>("#big-play");
+  const nowTitle = $("#now-title");
+  const nowTime = $("#now-time");
+  const seeker = $<HTMLInputElement>("#bc-seeker");
   const streamer = new Streamer(audio);
   const rows = Array.from(app.querySelectorAll<HTMLLIElement>("ol.tracks li"));
   let current = -1;
+
   const start = (i: number) => {
     current = i;
     rows.forEach((li, k) => { li.classList.toggle("on", k === i); li.classList.remove("playing"); });
+    const trackObj = m.tracks[i];
+    nowTitle.textContent = trackObj.title;
+    const durMs = trackObj.chunks.reduce((s, c) => s + c.ms, 0);
+    nowTime.textContent = `0:00 / ${fmtTime(durMs)}`;
+    seeker.value = "0";
     status.textContent = "Buffering...";
-    void streamer.play(m.tracks[i].chunks, (d, n) => (status.textContent = d < n ? `Buffering ${d}/${n}` : "")).catch((e) => (status.textContent = `Playback failed: ${e}`));
+    bigPlay.classList.add("playing");
+    void streamer.play(trackObj.chunks, (d, n) => (status.textContent = d < n ? `Buffering ${d}/${n}` : "")).catch((e) => {
+      status.textContent = `Playback failed: ${e}`;
+      bigPlay.classList.remove("playing");
+    });
   };
+
   rows.forEach((li, i) => ($<HTMLButtonElement>("button.play", li).onclick = () => {
-    if (i === current) return void (audio.paused ? audio.play() : audio.pause());
+    if (i === current) {
+      if (audio.paused) void audio.play(); else audio.pause();
+      return;
+    }
     start(i);
   }));
-  // a track's link button puts the link to that track in the share box
+
+  bigPlay.onclick = () => {
+    if (current === -1) {
+      start(initialTrackIdx);
+    } else {
+      if (audio.paused) void audio.play(); else audio.pause();
+    }
+  };
+
+  // Seeker & time sync
+  audio.ontimeupdate = () => {
+    const cur = audio.currentTime || 0;
+    const dur = audio.duration || (current >= 0 ? m.tracks[current].chunks.reduce((s, c) => s + c.ms, 0) / 1000 : 0);
+    if (dur > 0 && !seeker.matches(":active")) {
+      seeker.value = String((cur / dur) * 100);
+    }
+    nowTime.textContent = `${fmtTime(cur * 1000)} / ${fmtTime(dur * 1000)}`;
+  };
+
+  seeker.oninput = () => {
+    const dur = audio.duration || 0;
+    if (dur > 0) audio.currentTime = (Number(seeker.value) / 100) * dur;
+  };
+
   const shareTrack = (i: number) => {
     $("#share-what").textContent = `Link to “${m.tracks[i].title}”`;
     $<HTMLInputElement>("#share").value = pageUrl(`${hash}/${i}`);
@@ -390,18 +969,40 @@ async function releasePage(instance: string, params: string, track = -1) {
     shareTrack(i);
     $<HTMLInputElement>("#share").focus();
   }));
-  // opened from a track link: that track is marked and in view; playback still needs a click (browsers block autoplay)
-  if (rows[track]) {
+
+  // Copy share link button
+  const copyBtn = $<HTMLButtonElement>("#copy-btn");
+  if (copyBtn) {
+    copyBtn.onclick = () => {
+      const shareVal = $<HTMLInputElement>("#share").value;
+      void navigator.clipboard.writeText(shareVal).then(() => {
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => (copyBtn.textContent = "Copy"), 2000);
+      });
+    };
+  }
+
+  if (track >= 0 && rows[track]) {
     rows[track].classList.add("on");
     rows[track].scrollIntoView({ block: "center" });
     status.textContent = `Press ▶ to play “${m.tracks[track].title}”`;
     shareTrack(track);
   }
-  audio.onplaying = () => rows[current]?.classList.add("playing");
-  audio.onpause = () => rows[current]?.classList.remove("playing");
-  audio.onended = () => { if (current + 1 < m.tracks.length) start(current + 1); };
 
-  // ---- comments: everyone reads, only people with an identity write ----
+  audio.onplaying = () => {
+    rows[current]?.classList.add("playing");
+    bigPlay.classList.add("playing");
+  };
+  audio.onpause = () => {
+    rows[current]?.classList.remove("playing");
+    bigPlay.classList.remove("playing");
+  };
+  audio.onended = () => {
+    if (current + 1 < m.tracks.length) start(current + 1);
+    else bigPlay.classList.remove("playing");
+  };
+
+  // ---- comments ----
   const owner = params.slice(0, 64);
   let cs: CommentsState = { items: {}, removed: {} };
   let me: Identity | null = null, myName = "";
@@ -423,7 +1024,7 @@ async function releasePage(instance: string, params: string, track = -1) {
         <p>${esc(c.text)}</p>${me && (me.pk === c.a || me.pk === owner) ? `<button type="button" class="link" data-rm="${id}">Remove</button>` : ""}</div>`).join("")
       : `<p class="muted">No comments on this track yet.</p>`;
     box.querySelectorAll<HTMLButtonElement>("[data-rm]").forEach((b) => (b.onclick = async () => {
-      if (b.dataset.sure !== "1") { // two clicks, so a stray click does not remove anything
+      if (b.dataset.sure !== "1") {
         b.dataset.sure = "1"; b.textContent = "Click again to remove";
         setTimeout(() => { b.dataset.sure = ""; b.textContent = "Remove"; }, 4000);
         return;
@@ -466,13 +1067,13 @@ async function releasePage(instance: string, params: string, track = -1) {
     (e.currentTarget as HTMLElement).setAttribute("aria-expanded", String(open));
     if (open) { opened.add(t); buildPanel(t); } else opened.delete(t);
   }));
-  void meReady.then(() => opened.forEach(buildPanel)); // the identity may arrive after a panel was opened
+  void meReady.then(() => opened.forEach(buildPanel));
   if (m.comments) {
     void loadComments(m.comments).then((st) => { cs = st; drawCounts(); opened.forEach(drawList); }).catch(() => {});
     void watchRelease(m.comments).catch(() => {});
   }
 
-  // ---- reports: anyone can report (ante proof of work against spam); a report is public information, it hides nothing ----
+  // ---- reports ----
   let rs: ReportsState = { reports: {} };
   const drawReports = () => {
     const all = reportsFor(rs, instance), box = $("#reports");
@@ -525,34 +1126,27 @@ async function releasePage(instance: string, params: string, track = -1) {
     panel.hidden = !panel.hidden;
     if (!panel.hidden) buildReport(panel, WHOLE_RELEASE, `the release “${m.title}”`);
   };
-  void reloadReports().catch(() => {}); // after the rest is loaded: the first visitor on a node creates the contract
+  void reloadReports().catch(() => {});
 
-  // any subscribed contract can notify us: look at what changed
   const off = onRemoteChange(async () => {
-    if (!location.hash.startsWith(hash)) return; // a track link is this page too
-    try { if ((await loadRelease(instance, params)).meta.ts !== m.ts) $("#changed").hidden = false; } catch { /* keep the page as it is */ }
-    if (m.comments) { try { await reloadComments(); } catch { /* keep the page as it is */ } }
+    if (!location.hash.startsWith(hash)) return;
+    try { if ((await loadRelease(instance, params)).meta.ts !== m.ts) $("#changed").hidden = false; } catch {}
+    if (m.comments) { try { await reloadComments(); } catch {} }
   });
   window.addEventListener("hashchange", off, { once: true });
   $("#refresh").onclick = (e) => { e.preventDefault(); void releasePage(instance, params); };
 
-  // owner tools: only the artist's own key matches the first 32 bytes of the contract parameters
-  if (params.length > 96) { // the owner is a Viso persona (releases from before personas carry no app path)
-    const p = params.slice(0, 64);
-    $(".chips").insertAdjacentHTML("beforeend", `<span class="chip hot" title="Viso persona ${esc(personaName(p))}">Viso ${esc(personaName(p).slice(0, 8))}\u2026</span>`);
-  }
   void meReady.then((id) => {
     if (id?.pk !== params.slice(0, 64)) return;
-    if (rel.legacy) { // the node would refuse every change, so do not offer them
-      $("#owner").innerHTML = `<p class="muted"><small>Published with an older version of FreeTunes: it cannot be edited or removed. Publish it again for a release you can edit.</small></p>`;
+    if (rel.legacy) {
+      $("#owner").innerHTML = `<p class="muted"><small>Published with an older version of FreeTunes: cannot be edited.</small></p>`;
       return;
     }
-    $("#owner").innerHTML = `<a class="btn" href="#/edit/${esc(instance)}.${esc(params)}">Edit release</a><button id="del" class="danger" type="button">Remove release</button>`;
+    $("#owner").innerHTML = `<a class="btn small" href="#/edit/${esc(instance)}.${esc(params)}">Edit release</a><button id="del" class="danger small" type="button">Remove</button>`;
     $("#del").onclick = () => confirmRemoval(rel);
   });
 }
 
-/** Owner only: take the release down. Explained plainly, because the audio itself cannot be erased from Freenet. */
 function confirmRemoval(rel: Release) {
   const box = $("#confirm");
   box.innerHTML = `<div class="confirm">
@@ -582,8 +1176,6 @@ function confirmRemoval(rel: Release) {
 }
 
 // ---------------- identity ----------------
-
-/** Publishing needs an identity. Listening does not, so nothing asks for one until the user chooses to. */
 async function publishPage() {
   if (await peekIdentity()) return releaseForm();
   app.innerHTML = `
@@ -595,7 +1187,6 @@ async function publishPage() {
     </div>`;
 }
 
-/** Sign in with a Viso persona (once per node), set the artist name, sign out. */
 async function identityPage() {
   app.innerHTML = `<h1>Identity</h1><div id="idbox"><p class="muted">Loading...</p></div>`;
   const box = $("#idbox");
@@ -603,8 +1194,8 @@ async function identityPage() {
   try { me = await peekIdentity(); } catch (e) { box.innerHTML = `<p class="err">Could not read the identity: ${esc(String(e))}</p>`; return; }
 
   if (!me) {
-    const kept = await localIdentityKey(); // made here, but this node's app key changed: sign for it again
-    if (kept) { try { await createLocalIdentity(kept); return void (await identityPage()); } catch { /* show the choices */ } }
+    const kept = await localIdentityKey();
+    if (kept) { try { await createLocalIdentity(kept); return void (await identityPage()); } catch {} }
     const saved = (await storeGet("viso-url")) || officialViso();
     box.innerHTML = `
       <p class="muted">Your identity is your <b>Viso</b> persona: the same one you use in other Freenet apps. Sign in once on this node: Viso opens, you pick a persona, and it lets FreeTunes publish and comment on its behalf. No key or seed is shared, and there is nothing to back up here.</p>
@@ -671,10 +1262,8 @@ async function identityPage() {
   };
 }
 
-/** Open another page of this node (or any URL outside the sandbox) the way the Freenet shell allows. */
 const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
 
-/** Viso sent the user back here with its proof (or a refusal). */
 async function signInCallback(q: URLSearchParams) {
   app.innerHTML = `<h1>Viso</h1><p class="muted">Checking the proof...</p>`;
   let html: string;
@@ -683,11 +1272,11 @@ async function signInCallback(q: URLSearchParams) {
   } catch (e) {
     html = `<div class="notice"><b>Not signed in.</b> ${esc(String((e as Error).message ?? e))}</div>`;
   }
-  history.replaceState(null, "", location.pathname + "#/identity"); // the query must not run twice
+  history.replaceState(null, "", location.pathname + "#/identity");
   app.innerHTML = `<h1>Viso</h1>${html}<div class="actions"><a class="btn primary" href="#/identity">Continue</a></div>`;
 }
 
-// ---------------- admin: hide releases from the directory with the admin key (hash #/admin) ----------------
+// ---------------- admin ----------------
 async function admin() {
   app.innerHTML = `
     <p><a href="#/">← Back</a></p>
@@ -725,6 +1314,7 @@ async function admin() {
   };
 }
 
-// start last: route() uses consts declared above (TDZ otherwise)
+// Initialize header search bar and start routing
+initHeaderSearch();
 addEventListener("hashchange", route);
 route();
