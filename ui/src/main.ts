@@ -3,7 +3,9 @@ import {
   APP_PATH_HEX, blockReleases, createLocalIdentity, deleteRelease, finishSignIn, flushKnown, officialViso, fmtTime, getChunk,
   isRemoved, LICENSES, listRelease, loadComments, loadDirectory, loadRelease, makeCover, onRemoteChange, peekIdentity, personaName, publishRelease,
   localIdentityKey, postComment, putChunk, removeComment, signOut, takeDownOld, splitMp3, startSignIn, storeGet, storePut, Streamer, updateRelease,
-  watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE, type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta, type ReleaseMeta,
+  watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE,
+  FREETUNES_MAINTAINER, FREETUNES_DEFAULT_MODS, isMaintainer, isModerator,
+  type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta, type ReleaseMeta,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -631,6 +633,8 @@ async function artistPage(pk: string) {
             <div class="chips">
               <span class="chip hot">${rows.length + unlisted.length} release${rows.length + unlisted.length === 1 ? "" : "s"}</span>
               <span class="chip" title="${esc(pk)}">key ${esc(pk.slice(0, 8))}…</span>
+              ${isMaintainer(pk) ? `<span class="chip" style="background:#00a8ff; color:#fff; font-weight:700;" title="FreeTunes Creator & Maintainer">Maintainer</span>` : ""}
+              ${isModerator(pk) && !isMaintainer(pk) ? `<span class="chip" style="background:#00a878; color:#fff; font-weight:700;" title="FreeTunes Moderator">Moderator</span>` : ""}
               ${yours ? `<span class="chip hot">you</span>` : ""}
               ${yours ? `<button type="button" class="btn small" id="edit-profile-btn" style="margin-left:6px;">Edit Profile</button>` : ""}
             </div>
@@ -1495,39 +1499,148 @@ async function signInCallback(q: URLSearchParams) {
 
 // ---------------- admin ----------------
 async function admin() {
+  const me = await peekIdentity();
+  const userIsMaintainer = isMaintainer(me?.pk);
+  const userIsMod = isModerator(me?.pk);
+
   app.innerHTML = `
-    <p><a href="#/">← Back</a></p>
-    <h1>Directory admin</h1>
-    <p class="muted">Admin secret (hex) and the release ids to hide, one per line. This replaces the whole blocklist.</p>
-    <div class="card">
-      <input id="sk" type="password" autocomplete="off" placeholder="Admin secret" />
-      <textarea id="bl" rows="6" style="margin-top:10px"></textarea>
-      <div class="actions"><button id="go" class="primary" type="button">Publish blocklist</button><span id="msg" class="muted"></span></div>
-    </div>`;
-  try { $<HTMLTextAreaElement>("#bl").value = (await loadDirectory()).blocked.list.join("\n"); }
-  catch (e) { $("#msg").textContent = `Could not load the directory: ${e}`; }
-  app.insertAdjacentHTML("beforeend", `<h2>Reports</h2><div id="reps" class="card"><p class="muted">Loading...</p></div>`);
+    <p><a href="#/">← Back to Explore</a></p>
+    <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:1rem; flex-wrap:wrap; gap:10px;">
+      <h1 style="margin:0;">Directory Moderation</h1>
+      <span class="muted" style="font-size:0.85rem;">FreeTunes Public Governance</span>
+    </div>
+
+    ${userIsMod ? `
+      <div class="banner ok" style="margin-bottom:1.5rem; display:flex; align-items:center; gap:12px; padding:14px 18px; background:rgba(0,168,255,0.08); border:1px solid rgba(0,168,255,0.3); border-radius:8px;">
+        <span class="chip" style="background:#00a8ff; color:#fff; font-weight:700; margin:0;">${userIsMaintainer ? "Maintainer" : "Moderator"}</span>
+        <div style="font-size:0.9rem;">
+          Signed in with Viso as <b>${esc(me!.pk.slice(0, 8))}…${esc(me!.pk.slice(-6))}</b>.
+          <span class="muted">You are authorized to publish signed blocklists directly using your delegated session key (no raw secret key needed).</span>
+        </div>
+      </div>
+    ` : `
+      <div class="banner warn" style="margin-bottom:1.5rem; padding:14px 18px; background:rgba(255,165,0,0.08); border:1px solid rgba(255,165,0,0.3); border-radius:8px;">
+        <div style="font-weight:700; color:#ffb020; margin-bottom:4px;">Not signed in as Maintainer or Moderator</div>
+        <p class="muted" style="margin:0; font-size:0.9rem;">
+          To moderate using your Viso persona, <a href="#/identity">sign in with Viso</a> using the maintainer persona (<code>${esc(FREETUNES_MAINTAINER.slice(0, 8))}…</code>) or an authorized moderator key.
+          Alternatively, you can provide an admin secret key below.
+        </p>
+      </div>
+    `}
+
+    <div class="card" style="margin-bottom:1.5rem;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+        <h3 style="margin:0;">Active Blocklist</h3>
+        <span id="bl-count" class="muted" style="font-size:0.85rem;">Loading...</span>
+      </div>
+      <p class="muted" style="font-size:0.85rem; margin-top:0;">Release IDs hidden from the public directory (Explore, Artists, and Search), one ID per line.</p>
+
+      ${userIsMod ? `
+        <details style="margin-bottom:10px;">
+          <summary class="muted" style="cursor:pointer; font-size:0.8rem;">Manual secret key fallback (optional)</summary>
+          <input id="sk" type="password" autocomplete="off" placeholder="Optional raw admin secret (hex)" style="margin-top:6px;" />
+        </details>
+      ` : `
+        <input id="sk" type="password" autocomplete="off" placeholder="Admin secret (hex)" style="margin-bottom:10px;" />
+      `}
+
+      <textarea id="bl" rows="6" placeholder="Release IDs, one per line (e.g. 5x...)" style="font-family:monospace; font-size:0.85rem;"></textarea>
+      <div class="actions" style="margin-top:10px; display:flex; align-items:center; gap:12px;">
+        <button id="go" class="primary" type="button">${userIsMod ? "Sign & Publish Blocklist" : "Publish Blocklist"}</button>
+        <span id="msg" class="muted" style="font-size:0.9rem;"></span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:1.5rem; background:rgba(255,255,255,0.02); font-size:0.85rem;">
+      <h4 style="margin:0 0 8px;">Federated Governance & Roles</h4>
+      <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:12px;">
+        <div>
+          <b>Maintainer:</b> <span class="chip" style="background:#00a8ff; color:#fff; font-size:0.75rem;">Root Admin</span><br/>
+          <code style="word-break:break-all;">${FREETUNES_MAINTAINER}</code>
+        </div>
+        <div>
+          <b>Default Moderators:</b> <span class="chip" style="background:#00a878; color:#fff; font-size:0.75rem;">Mod</span><br/>
+          ${FREETUNES_DEFAULT_MODS.map((m) => `<code style="word-break:break-all;">${m}</code>`).join("<br/>")}
+        </div>
+      </div>
+      <p class="muted" style="margin:8px 0 0; font-size:0.8rem;">
+        Blocklists are verified by the smart contract in Freenet (<code>directory.wasm</code>). Signed updates from the Maintainer or authorized Moderators take effect immediately on-chain.
+      </p>
+    </div>
+
+    <h2>Community Reports Queue</h2>
+    <div id="reps" class="card"><p class="muted">Loading reports...</p></div>
+  `;
+
   try {
-    const all = Object.values((await loadReports()).reports).sort((a, b) => b.ts - a.ts), box = $("#reps");
+    const dir = await loadDirectory();
+    $<HTMLTextAreaElement>("#bl").value = dir.blocked.list.join("\n");
+    const countEl = $("#bl-count");
+    if (countEl) countEl.textContent = `${dir.blocked.list.length} release${dir.blocked.list.length === 1 ? "" : "s"} currently blocked`;
+  } catch (e) {
+    $("#msg").textContent = `Could not load the directory: ${e}`;
+  }
+
+  try {
+    const all = Object.values((await loadReports()).reports).sort((a, b) => b.ts - a.ts);
+    const box = $("#reps");
     const byRelease = new Map<string, typeof all>();
     for (const r of all) byRelease.set(r.target, [...(byRelease.get(r.target) ?? []), r]);
-    box.innerHTML = all.length ? [...byRelease].sort(([, a], [, b]) => b.length - a.length).map(([target, rs]) => `
-      <div class="rep"><b>${rs.length} report${rs.length === 1 ? "" : "s"}</b> · <code>${esc(target)}</code>
-        <button type="button" class="link" data-block="${esc(target)}">Add to blocklist</button>
-        ${rs.map((r) => `<p><span class="chip">${esc(r.kind)}</span> ${r.track === WHOLE_RELEASE ? "release" : `track ${r.track + 1}`} · ${esc(r.note || "(no note)")}
-          <small class="muted">${r.contact ? `contact: ${esc(r.contact)} · ` : ""}ante ${esc(r.a.slice(0, 8))}… · ${new Date(r.ts).toLocaleString()}</small></p>`).join("")}</div>`).join("")
-      : `<p class="muted">No reports.</p>`;
+
+    box.innerHTML = all.length
+      ? [...byRelease].sort(([, a], [, b]) => b.length - a.length).map(([target, rs]) => {
+          const blText = $<HTMLTextAreaElement>("#bl")?.value ?? "";
+          const isAlreadyBlocked = blText.split("\n").map((s) => s.trim()).includes(target);
+          return `
+            <div class="rep" style="padding:12px; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.06);">
+              <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                <div>
+                  <b>${rs.length} report${rs.length === 1 ? "" : "s"}</b> · <code>${esc(target)}</code>
+                  ${isAlreadyBlocked ? `<span class="chip" style="background:#e74c3c; color:#fff; margin-left:6px;">Blocked</span>` : ""}
+                </div>
+                <button type="button" class="btn small ${isAlreadyBlocked ? "" : "primary"}" data-block="${esc(target)}">
+                  ${isAlreadyBlocked ? "Already in blocklist" : "+ Add to blocklist"}
+                </button>
+              </div>
+              <div style="margin-top:8px;">
+                ${rs.map((r) => `
+                  <p style="margin:4px 0;"><span class="chip">${esc(r.kind)}</span> ${r.track === WHOLE_RELEASE ? "release" : `track ${r.track + 1}`} · ${esc(r.note || "(no note)")}
+                  <small class="muted" style="display:block; margin-top:2px;">${r.contact ? `contact: ${esc(r.contact)} · ` : ""}ante ${esc(r.a.slice(0, 8))}… · ${new Date(r.ts).toLocaleString()}</small></p>
+                `).join("")}
+              </div>
+            </div>`;
+        }).join("")
+      : `<p class="muted">No community reports.</p>`;
+
     box.querySelectorAll<HTMLButtonElement>("[data-block]").forEach((b) => (b.onclick = () => {
-      const t = $<HTMLTextAreaElement>("#bl"), id = b.dataset.block!;
-      if (!t.value.split("\n").includes(id)) t.value = (t.value.trim() ? t.value.trim() + "\n" : "") + id;
-      b.textContent = "Added: now publish the blocklist";
+      const t = $<HTMLTextAreaElement>("#bl");
+      const id = b.dataset.block!;
+      const current = t.value.split("\n").map((l) => l.trim()).filter(Boolean);
+      if (!current.includes(id)) {
+        current.push(id);
+        t.value = current.join("\n");
+      }
+      b.textContent = "✓ Added to list";
+      b.classList.remove("primary");
+      const countEl = $("#bl-count");
+      if (countEl) countEl.textContent = `${current.length} release${current.length === 1 ? "" : "s"} in blocklist`;
     }));
-  } catch (e) { $("#reps").innerHTML = `<p class="err">Could not load the reports: ${esc(String(e))}</p>`; }
+  } catch (e) {
+    $("#reps").innerHTML = `<p class="err">Could not load the reports: ${esc(String(e))}</p>`;
+  }
+
   $("#go").onclick = async () => {
     const list = $<HTMLTextAreaElement>("#bl").value.split("\n").map((l) => l.trim()).filter(Boolean);
-    $("#msg").textContent = "Sending...";
-    try { await blockReleases($<HTMLInputElement>("#sk").value.trim(), list); $("#msg").textContent = `Done: ${list.length} blocked.`; }
-    catch (e) { $("#msg").textContent = `Error: ${e}`; }
+    const skVal = $<HTMLInputElement>("#sk")?.value?.trim() || "";
+    $("#msg").textContent = "Signing and publishing blocklist...";
+    try {
+      await blockReleases(skVal, list);
+      $("#msg").textContent = `✓ Success: ${list.length} release${list.length === 1 ? "" : "s"} blocked in public directory.`;
+      const countEl = $("#bl-count");
+      if (countEl) countEl.textContent = `${list.length} release${list.length === 1 ? "" : "s"} currently blocked`;
+    } catch (e) {
+      $("#msg").textContent = `Error: ${e instanceof Error ? e.message : String(e)}`;
+    }
   };
 }
 

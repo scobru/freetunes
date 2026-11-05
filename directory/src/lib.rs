@@ -31,11 +31,19 @@ pub struct Entry {
     pub cert: Cert,  // the owner's delegation to that key, for the app path in `params`
 }
 
+pub const DEFAULT_MODS: &[&str] = &[
+    "3ac3e7f1f7535888597dbd8b25e362fa153eb10bfedd1e2df1b50299d7f2bf98", // Ivvor
+];
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Blocklist {
     pub ts: u64,
     pub list: Vec<String>,
-    pub sig: String, // hex, by admin over `ftb1|<ts>|<list joined by ,>`
+    pub sig: String, // hex, by admin or moderator over `ftb1|<ts>|<list joined by ,>`
+    #[serde(default)]
+    pub cert: Option<Cert>, // Viso delegation from admin or moderator
+    #[serde(default)]
+    pub signer: Option<String>, // Persona hex of the moderator/admin who signed
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -116,6 +124,15 @@ fn check_entry(instance: &str, e: &Entry) -> R<()> {
     Ok(())
 }
 
+fn is_authorized(admin: &str, signer: &str) -> bool {
+    signer.eq_ignore_ascii_case(admin) || DEFAULT_MODS.iter().any(|m| m.eq_ignore_ascii_case(signer))
+}
+
+fn path_of(base: &str) -> Option<&str> {
+    let rest = base.strip_prefix("http://").or_else(|| base.strip_prefix("https://"))?;
+    Some(&rest[rest.find('/')?..])
+}
+
 fn check_blocklist(admin: &str, b: &Blocklist) -> R<()> {
     if b.ts == 0 && b.list.is_empty() && b.sig.is_empty() {
         return Ok(()); // initial empty state
@@ -123,7 +140,19 @@ fn check_blocklist(admin: &str, b: &Blocklist) -> R<()> {
     if b.list.len() > 10_000 || !b.list.iter().all(|i| is_id(i)) {
         return Err("bad blocklist".into());
     }
-    verify(&key(admin)?, format!("ftb1|{}|{}", b.ts, b.list.join(",")).as_bytes(), &b.sig)
+    let msg = format!("ftb1|{}|{}", b.ts, b.list.join(","));
+    match &b.cert {
+        None => verify(&key(admin)?, msg.as_bytes(), &b.sig),
+        Some(cert) => {
+            let signer = b.signer.as_deref().unwrap_or(admin);
+            if !is_authorized(admin, signer) {
+                return Err("signer is not admin or moderator".into());
+            }
+            let app = path_of(&cert.base).ok_or("invalid cert base URL")?;
+            let app_key = check_cert(signer, app, cert)?;
+            verify(&app_key, msg.as_bytes(), &b.sig)
+        }
+    }
 }
 
 /// Keep the newest `max` entries; deterministic, so merge order does not matter.
@@ -291,7 +320,19 @@ mod tests {
     fn block(admin: &SigningKey, ts: u64, list: &[&str]) -> Blocklist {
         let list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
         let sig = hex::encode(admin.sign(format!("ftb1|{ts}|{}", list.join(",")).as_bytes()).to_bytes());
-        Blocklist { ts, list, sig }
+        Blocklist { ts, list, sig, cert: None, signer: None }
+    }
+
+    fn block_delegated(signer_persona: &SigningKey, ts: u64, list: &[&str]) -> Blocklist {
+        let list: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        let app = "/v1/contract/web/Tunes1/";
+        let app_key = sk(200);
+        let (base, challenge) = (format!("http://127.0.0.1:7509{app}"), format!("wd1.{}.n1", pk(&app_key)));
+        let csig = signer_persona.sign(&whoiam_delegation::connect_message(signer_persona.verifying_key().as_bytes(), &base, &challenge, 1));
+        let cert = Cert { base, challenge, ts: 1, sig: hex::encode(csig.to_bytes()) };
+        let msg = format!("ftb1|{ts}|{}", list.join(","));
+        let sig = hex::encode(app_key.sign(msg.as_bytes()).to_bytes());
+        Blocklist { ts, list, sig, cert: Some(cert), signer: Some(pk(signer_persona)) }
     }
 
     #[test]
@@ -324,13 +365,22 @@ mod tests {
         lazy.nonce += 1; // almost surely no longer meets the difficulty (fails with probability 2^-18)
         assert!(check_entry("PollB", &lazy).is_err());
 
-        // blocklist must be signed by the admin
+        // blocklist must be signed by the admin or an authorized moderator
         let fake = block(&sk(9), 1, &["PollA"]);
         assert!(apply(&a, &mut s, Delta { entries: Default::default(), blocked: Some(fake) }).is_err());
         let good = block(&admin_sk, 1, &["PollA"]);
         apply(&a, &mut s, Delta { entries: Default::default(), blocked: Some(good) }).unwrap();
         assert!(s.entries.is_empty());
         validate(&a, &s).unwrap();
+
+        // delegated blocklist by admin persona succeeds
+        let del_admin = block_delegated(&admin_sk, 2, &["PollA"]);
+        apply(&a, &mut s, Delta { entries: Default::default(), blocked: Some(del_admin) }).unwrap();
+
+        // unauthorized persona delegated blocklist is rejected
+        let unauthorized = sk(201);
+        let del_unauth = block_delegated(&unauthorized, 3, &["PollA"]);
+        assert!(apply(&a, &mut s, Delta { entries: Default::default(), blocked: Some(del_unauth) }).is_err());
         // blocked instance cannot come back, even with a valid entry
         let again = entry("PollA", &sk(2), "Again", 99);
         apply(&a, &mut s, Delta { entries: [("PollA".into(), again)].into(), blocked: None }).unwrap();

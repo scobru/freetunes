@@ -57,11 +57,35 @@ export interface CommentsState { items: Record<string, Comment>; removed: Record
 export interface DirEntry {
   params: string; title: string; artist: string; cover?: string; removed?: boolean; ts: number; nonce: number; sig: string; cert: Cert;
 }
-export interface DirState { entries: Record<string, DirEntry>; blocked: { ts: number; list: string[]; sig: string } }
+export interface BlocklistState {
+  ts: number;
+  list: string[];
+  sig: string;
+  cert?: Cert;
+  signer?: string;
+}
+export interface DirState { entries: Record<string, DirEntry>; blocked: BlocklistState }
 
-// The directory address depends on this admin key (its parameter): changing it creates a new, empty directory.
-export const DIRECTORY_ADMIN = "4498bd4c2ab992afa152bc9b968e246cf70dc4fa5a670b23c33e73b8516ce9f3";
+/** FreeTunes creator / maintainer public key (Scobru). */
+export const FREETUNES_MAINTAINER = "464b576da4cc5bcf31febd41a863ac251d04024c19f1786b24ca6620a0cce53b";
+/** FreeTunes default moderators (Ivvor), same structure as Radica. */
+export const FREETUNES_DEFAULT_MODS: readonly string[] = [
+  "3ac3e7f1f7535888597dbd8b25e362fa153eb10bfedd1e2df1b50299d7f2bf98",
+];
+
+// The directory address depends on this admin key (its parameter): maintainer Scobru.
+export const DIRECTORY_ADMIN = FREETUNES_MAINTAINER;
 const POW_BITS = 18; // must match directory/src/lib.rs (sha256, a few seconds of mining)
+
+export function isMaintainer(pk?: string | null): boolean {
+  return !!pk && pk.toLowerCase() === FREETUNES_MAINTAINER.toLowerCase();
+}
+
+export function isModerator(pk?: string | null): boolean {
+  if (!pk) return false;
+  const norm = pk.toLowerCase();
+  return norm === FREETUNES_MAINTAINER.toLowerCase() || FREETUNES_DEFAULT_MODS.map((m) => m.toLowerCase()).includes(norm);
+}
 
 // ---------------------------------------------------------------- node connection
 interface Waiter { resolve(r: DelegateResponse): void; reject(e: Error): void }
@@ -516,12 +540,28 @@ export async function listRelease(instance: string, params: string, title: strin
   await sendDelta(await directoryId(), { entries: { [instance]: { params, title, artist, cover, removed, ts, nonce, sig, cert: me.cert } } });
 }
 
-/** Admin only: replace the blocklist (blocked releases disappear from the directory). */
-export async function blockReleases(adminSecretHex: string, list: string[]) {
+/** Admin / Moderator: replace the blocklist (blocked releases disappear from the directory).
+ * Signs with the active Viso session if signed in as maintainer/mod, or with the provided adminSecretHex. */
+export async function blockReleases(adminSecretHexOrEmpty: string, list: string[]) {
   const ts = Date.now();
-  const sig = hex(await ed.signAsync(enc.encode(`ftb1|${ts}|${list.join(",")}`), unhex(adminSecretHex)));
+  const msg = `ftb1|${ts}|${list.join(",")}`;
+  let blocked: BlocklistState;
+
+  if (adminSecretHexOrEmpty.trim()) {
+    const sig = hex(await ed.signAsync(enc.encode(msg), unhex(adminSecretHexOrEmpty.trim())));
+    blocked = { ts, list, sig };
+  } else {
+    const me = await peekIdentity();
+    if (!me) throw new Error("Sign in with Viso to publish the blocklist (or provide an admin secret key).");
+    if (!isModerator(me.pk)) {
+      throw new Error(`Your identity (@${me.pk.slice(0, 8)}...) is not a FreeTunes maintainer or moderator.`);
+    }
+    const sig = await me.sign(msg);
+    blocked = { ts, list, sig, cert: me.cert, signer: me.pk };
+  }
+
   await loadDirectory();
-  await sendDelta(await directoryId(), { blocked: { ts, list, sig } });
+  await sendDelta(await directoryId(), { blocked });
 }
 
 // ---------------------------------------------------------------- comments (see comments/src/lib.rs)
