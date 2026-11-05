@@ -1013,3 +1013,35 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, m
 }
 
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* Artist Profile & Bio */
+.bc-artist-bio {
+  padding: 20px;
+  margin: 18px 0 24px;
+}
+.bc-artist-bio p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-top: 8px;
+  font-size: .95rem;
+  line-height: 1.6;
+}
+.profile-editor-card {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin: 16px 0 24px;
+  box-shadow: var(--shadow);
+  animation: fadeIn .2s ease-out;
+}
+.profile-avatar-pick {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 14px 0 16px;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}

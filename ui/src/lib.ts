@@ -48,6 +48,8 @@ export interface ReleaseMeta {
   comments?: string;
   /** Free text about the release (credits, notes, links), shown on the release page. */
   about?: string;
+  artist_avatar?: string;
+  artist_bio?: string;
 }
 export interface Comment { a: string; name: string; track: number; ts: number; text: string; nonce: number; sig: string; cert: Cert }
 export interface Removal { by: string; ts: number; nonce: number; sig: string; cert: Cert }
