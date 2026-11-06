@@ -176,7 +176,7 @@ const idOfHash = (hash: string) => hash.split("/")[2]?.split(".")[0] ?? hash;
 async function searchCatalog(query: string) {
   const q = query.trim().toLowerCase();
   const dir = await loadDirectory().catch(() => ({ entries: {}, blocked: { ts: 0, list: [], sig: "" } }));
-  const rows = Object.entries(dir.entries).filter(([, e]) => !e.removed && e.params.slice(96) === APP_PATH_HEX);
+  const rows = Object.entries(dir.entries).filter(([, e]) => !e.removed);
 
   // Group by artist
   const artistMap = new Map<string, { pk: string; name: string; releases: typeof rows; latestCover?: string; latestTs: number }>();
@@ -319,7 +319,7 @@ async function explore() {
   });
 
   try {
-    const rows = Object.entries((await loadDirectory()).entries).filter(([, e]) => !e.removed && e.params.slice(96) === APP_PATH_HEX).sort(([, a], [, b]) => b.ts - a.ts);
+    const rows = Object.entries((await loadDirectory()).entries).filter(([, e]) => !e.removed).sort(([, a], [, b]) => b.ts - a.ts);
     $("#list").innerHTML = rows.length
       ? `<div class="grid">${rows.map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover, ` · ${new Date(e.ts).toLocaleDateString()}`)).join("")}</div>`
       : `<div class="empty">No releases listed yet. Be the first to publish one.</div>`;
@@ -344,7 +344,7 @@ async function artistsPage() {
 
   try {
     const dir = await loadDirectory();
-    const rows = Object.entries(dir.entries).filter(([, e]) => !e.removed && e.params.slice(96) === APP_PATH_HEX);
+    const rows = Object.entries(dir.entries).filter(([, e]) => !e.removed);
 
     const artists = new Map<string, {
       pk: string;
@@ -547,7 +547,7 @@ async function searchPage(initialQuery = "") {
   // Progressive background track indexer for unindexed directory releases
   void loadDirectory().then(async (dir) => {
     const unindexed = Object.entries(dir.entries)
-      .filter(([id, e]) => !e.removed && e.params.slice(96) === APP_PATH_HEX && !trackCache.some((t) => t.albumId === id))
+      .filter(([id, e]) => !e.removed && !trackCache.some((t) => t.albumId === id))
       .slice(0, 10);
     for (const [id, e] of unindexed) {
       try {
@@ -592,7 +592,7 @@ async function artistPage(pk: string) {
   app.innerHTML = `<p class="muted">Loading... (the first visit on a node can take up to 30 s)</p>`;
   try {
     const [dir, me] = await Promise.all([loadDirectory(), peekIdentity()]);
-    const rows = Object.entries(dir.entries).filter(([, e]) => e.params.slice(0, 64) === pk && !e.removed && e.params.slice(96) === APP_PATH_HEX).sort(([, a], [, b]) => b.ts - a.ts);
+    const rows = Object.entries(dir.entries).filter(([, e]) => e.params.slice(0, 64) === pk && !e.removed).sort(([, a], [, b]) => b.ts - a.ts);
     const yours = me?.pk === pk;
     const listed = new Set(rows.map(([id]) => id));
     const unlisted = yours ? (await myReleases()).filter((r) => !listed.has(idOfHash(r.hash))) : [];
@@ -843,13 +843,21 @@ function releaseForm(existing?: Release) {
     </div>
 
     <label class="check"><input id="rights" type="checkbox" />${esc(RIGHTS_TEXT)}</label>
-    <label class="check" id="list-row" ${edit ? "hidden" : ""}><input id="list" type="checkbox" checked />${edit ? "Update the public directory entry" : "List in the public directory (the title, artist and cover become discoverable)"}</label>
+    <label class="check" id="list-row"><input id="list" type="checkbox" checked /><span id="list-label">${edit ? "Update the public directory entry" : "List in the public directory (the title, artist and cover become discoverable)"}</span></label>
     <div class="actions"><button id="go" type="button" class="primary">${edit ? "Save changes" : "Publish"}</button><span id="msg" class="muted"></span></div>
     <progress id="bar" max="100" value="0" hidden></progress>`;
 
   if (!edit) void storeGet("artist").then((a) => { if (a && !$<HTMLInputElement>("#artist").value) $<HTMLInputElement>("#artist").value = a; });
   if (existing) {
-    void loadDirectory().then((d) => { const e = d.entries[existing.instance]; if (e && !e.removed) $("#list-row").hidden = false; }).catch(() => {});
+    void loadDirectory().then((d) => {
+      const e = d.entries[existing.instance];
+      const lbl = $<HTMLElement>("#list-label");
+      if (lbl) {
+        lbl.textContent = (e && !e.removed)
+          ? "Update the public directory entry"
+          : "List in the public directory (the title, artist and cover become discoverable)";
+      }
+    }).catch(() => {});
   }
   lazyCovers($("#prev"));
 
@@ -949,7 +957,7 @@ function releaseForm(existing?: Release) {
       const hash = `#/r/${instance}.${params}`;
       await saveRelease({ title, artist, hash, cover: cover?.addr });
       await storePut("artist", artist);
-      if (!$("#list-row").hidden && $<HTMLInputElement>("#list").checked) {
+      if ($<HTMLInputElement>("#list")?.checked) {
         msg.textContent = "Updating the public directory (a few seconds of proof-of-work)...";
         try { await listRelease(instance, params, title.slice(0, 120), artist.slice(0, 80), cover?.addr ?? ""); }
         catch (e) { return void (msg.innerHTML = `Saved, but the directory update failed: ${esc(String(e))}. <a href="${esc(hash)}">Open the release</a>`); }
@@ -1106,7 +1114,7 @@ async function releasePage(instance: string, params: string, track = -1) {
   void loadDirectory().then((dir) => {
     const pk = params.slice(0, 64);
     const others = Object.entries(dir.entries)
-      .filter(([id, e]) => e.params.slice(0, 64) === pk && id !== instance && !e.removed && e.params.slice(96) === APP_PATH_HEX)
+      .filter(([id, e]) => e.params.slice(0, 64) === pk && id !== instance && !e.removed)
       .sort(([, a], [, b]) => b.ts - a.ts);
     const disco = $("#bc-disco");
     if (!disco) return;
