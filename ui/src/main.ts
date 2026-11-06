@@ -231,8 +231,53 @@ export async function addMyArtist(name: string) {
   }
 }
 
+// ---------------- creator name helper functions ----------------
+export async function getCreatorName(pk?: string): Promise<string | null> {
+  try {
+    if (pk) {
+      const perPk = await storeGet(`creator-name:${pk}`);
+      if (perPk?.trim()) return perPk.trim();
+      if (typeof localStorage !== "undefined") {
+        const localPk = localStorage.getItem(`ft-creator-name-${pk}`);
+        if (localPk?.trim()) return localPk.trim();
+      }
+      const prof = await getArtistProfile(pk);
+      if (prof?.name?.trim()) return prof.name.trim();
+    }
+    const globalName = await storeGet("creator-name");
+    if (globalName?.trim()) return globalName.trim();
+    if (typeof localStorage !== "undefined") {
+      const local = localStorage.getItem("ft-creator-name");
+      if (local?.trim()) return local.trim();
+    }
+  } catch {}
+  return null;
+}
+
+export async function setCreatorName(name: string, pk?: string): Promise<void> {
+  const norm = name.trim();
+  try {
+    if (norm) {
+      await storePut("creator-name", norm);
+      if (typeof localStorage !== "undefined") localStorage.setItem("ft-creator-name", norm);
+      if (pk) {
+        await storePut(`creator-name:${pk}`, norm);
+        if (typeof localStorage !== "undefined") localStorage.setItem(`ft-creator-name-${pk}`, norm);
+        await saveArtistProfile(pk, { name: norm });
+      }
+    } else {
+      await storePut("creator-name", "");
+      if (typeof localStorage !== "undefined") localStorage.removeItem("ft-creator-name");
+      if (pk) {
+        await storePut(`creator-name:${pk}`, "");
+        if (typeof localStorage !== "undefined") localStorage.removeItem(`ft-creator-name-${pk}`);
+      }
+    }
+  } catch {}
+}
+
 // ---------------- my releases (kept by the identity delegate, or localStorage as a fallback) ----------------
-type Saved = { title: string; artist: string; hash: string; cover?: string };
+type Saved = { title: string; artist: string; hash: string; cover?: string; creator?: string };
 const myReleases = async (): Promise<Saved[]> => { try { return JSON.parse((await storeGet("releases")) ?? "[]"); } catch { return []; } };
 const saveRelease = async (r: Saved) => storePut("releases", JSON.stringify([r, ...(await myReleases()).filter((x) => x.hash !== r.hash)]));
 const forgetRelease = async (hash: string) => storePut("releases", JSON.stringify((await myReleases()).filter((x) => x.hash !== hash)));
@@ -696,7 +741,16 @@ async function renderCreatorHub(
   allArtists: string[],
   yours: boolean
 ) {
-  const creatorName = (yours ? (await storeGet("creator-name")) : null) || personaName(pk);
+  let releaseCreator: string | undefined;
+  if (rows.length > 0) {
+    try {
+      const firstRel = await loadRelease(rows[0][0], rows[0][1].params);
+      if (firstRel?.meta?.creator?.trim()) {
+        releaseCreator = firstRel.meta.creator.trim();
+      }
+    } catch {}
+  }
+  const creatorName = (await getCreatorName(pk)) || releaseCreator || personaName(pk);
   const totalReleases = rows.length + unlisted.length;
 
   const artistProfiles = new Map<string, ArtistProfile | null>();
@@ -708,7 +762,7 @@ async function renderCreatorHub(
     <p><a href="#/artists">← All artists</a></p>
     <div class="bc-section-header">
       <div style="display:flex; align-items:center; gap:18px;">
-        <div class="artist-avatar" style="--h:${hueOf(pk)}; width:80px; height:80px; font-size:2rem;">
+        <div class="artist-avatar" id="creator-header-avatar" style="--h:${hueOf(pk)}; width:80px; height:80px; font-size:2rem;">
           <span>${esc((creatorName.trim()[0] ?? "C").toUpperCase())}</span>
         </div>
         <div>
@@ -721,12 +775,34 @@ async function renderCreatorHub(
             ${isMaintainer(pk) ? `<span class="chip" style="background:#00a8ff; color:#fff; font-weight:700;" title="FreeTunes Creator & Maintainer">Maintainer</span>` : ""}
             ${isModerator(pk) && !isMaintainer(pk) ? `<span class="chip" style="background:#00a878; color:#fff; font-weight:700;" title="FreeTunes Moderator">Moderator</span>` : ""}
             ${yours ? `<span class="chip hot">you</span>` : ""}
+            ${yours ? `<button type="button" class="btn small" id="edit-creator-btn" style="margin-left:6px;">Edit Creator Name</button>` : ""}
           </div>
         </div>
       </div>
     </div>
 
-    <h2>Artists managed by ${esc(creatorName)}</h2>
+    ${yours ? `
+      <div class="card profile-editor-card" id="creator-editor" hidden style="margin: 16px 0;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <h3 style="margin:0;">Edit Creator / Publisher Name</h3>
+          <button type="button" class="btn small" id="creator-close-btn">✕</button>
+        </div>
+        <p class="muted"><small>Choose a public name for your creator account (shown on this hub, in Radica, and when publishing music).</small></p>
+
+        <label class="field">
+          <span>Creator Name</span>
+          <input id="creator-name-input" maxlength="80" value="${esc(creatorName === personaName(pk) ? "" : creatorName)}" placeholder="e.g. Scobru, Blue Records, etc." />
+        </label>
+
+        <div class="actions">
+          <button type="button" class="btn primary" id="creator-save-btn">Save Creator Name</button>
+          <button type="button" class="btn" id="creator-cancel-btn">Cancel</button>
+          <span id="creator-msg" class="muted"></span>
+        </div>
+      </div>
+    ` : ""}
+
+    <h2 id="creator-artists-heading">Artists managed by ${esc(creatorName)}</h2>
     <div class="artists-grid">
       ${allArtists.map((aName) => {
         const aRows = rows.filter(([, e]) => e.artist.trim().toLowerCase() === aName.toLowerCase());
@@ -782,6 +858,67 @@ async function renderCreatorHub(
 
   lazyCovers(app);
 
+  if (yours) {
+    const editBtn = app.querySelector<HTMLButtonElement>("#edit-creator-btn");
+    const editor = app.querySelector<HTMLElement>("#creator-editor");
+    const closeBtn = app.querySelector<HTMLButtonElement>("#creator-close-btn");
+    const cancelBtn = app.querySelector<HTMLButtonElement>("#creator-cancel-btn");
+    const saveBtn = app.querySelector<HTMLButtonElement>("#creator-save-btn");
+    const msg = app.querySelector<HTMLElement>("#creator-msg")!;
+    const nameInput = app.querySelector<HTMLInputElement>("#creator-name-input")!;
+
+    const toggleEditor = (open: boolean) => {
+      if (editor) editor.hidden = !open;
+      if (editBtn) editBtn.hidden = open;
+      if (open) nameInput?.focus();
+    };
+
+    if (editBtn) editBtn.onclick = () => toggleEditor(true);
+    if (closeBtn) closeBtn.onclick = () => toggleEditor(false);
+    if (cancelBtn) cancelBtn.onclick = () => toggleEditor(false);
+
+    if (saveBtn) {
+      saveBtn.onclick = async () => {
+        const val = nameInput.value.trim();
+        saveBtn.disabled = true;
+        msg.textContent = "Saving...";
+        try {
+          await setCreatorName(val, pk);
+          const displayName = val || personaName(pk);
+          const headerName = app.querySelector<HTMLElement>("#creator-header-name");
+          if (headerName) headerName.textContent = displayName;
+          const avatarSpan = app.querySelector<HTMLElement>("#creator-header-avatar span");
+          if (avatarSpan) avatarSpan.textContent = (displayName.trim()[0] ?? "C").toUpperCase();
+          const heading = app.querySelector<HTMLElement>("#creator-artists-heading");
+          if (heading) heading.textContent = `Artists managed by ${displayName}`;
+
+          if (rows.length > 0 && val) {
+            try {
+              const [inst, entry] = rows[0];
+              const rel = await loadRelease(inst, entry.params);
+              if (rel && !rel.legacy && !rel.meta.deleted) {
+                await updateRelease(inst, entry.params, {
+                  ...rel.meta,
+                  creator: val,
+                }, rel.meta.ts);
+              }
+            } catch {}
+          }
+
+          msg.textContent = "Saved!";
+          setTimeout(() => {
+            toggleEditor(false);
+            msg.textContent = "";
+            saveBtn.disabled = false;
+          }, 500);
+        } catch (e) {
+          msg.textContent = `Could not save: ${esc(String(e))}`;
+          saveBtn.disabled = false;
+        }
+      };
+    }
+  }
+
   const tabs = app.querySelectorAll<HTMLButtonElement>("#creator-tabs .search-tab");
   const relCards = app.querySelectorAll<HTMLElement>("#creator-rel-grid .rel");
   tabs.forEach((tab) => {
@@ -834,6 +971,7 @@ async function renderSingleArtist(
   let removeAvatar = false;
 
   const otherArtists = allArtists.filter((a) => a.toLowerCase() !== artistName.toLowerCase());
+  const creatorDisp = (await getCreatorName(pk)) || releaseWithProfile?.meta?.creator || `${personaName(pk).slice(0, 8)}…`;
 
   app.innerHTML = `
     <p><a href="#/artists">← All artists</a></p>
@@ -848,7 +986,7 @@ async function renderSingleArtist(
           <h1 style="margin-bottom:4px;" id="artist-header-name">${esc(name)}</h1>
           <div class="chips">
             <span class="chip hot">${totalReleases} release${totalReleases === 1 ? "" : "s"}</span>
-            <a class="chip" href="#/a/${esc(pk)}" title="Publisher key: ${esc(pk)}">Creator ${esc(personaName(pk).slice(0, 8))}…</a>
+            <a class="chip" href="#/a/${esc(pk)}" title="Publisher key: ${esc(pk)}">Creator ${esc(creatorDisp)}</a>
             ${isMaintainer(pk) ? `<span class="chip" style="background:#00a8ff; color:#fff; font-weight:700;" title="FreeTunes Creator & Maintainer">Maintainer</span>` : ""}
             ${isModerator(pk) && !isMaintainer(pk) ? `<span class="chip" style="background:#00a878; color:#fff; font-weight:700;" title="FreeTunes Moderator">Moderator</span>` : ""}
             ${yours ? `<span class="chip hot">you</span>` : ""}
@@ -1199,12 +1337,14 @@ async function releaseForm(existing?: Release) {
       await flushKnown();
       const meId = await peekIdentity();
       const meProf = meId ? await getArtistProfile(meId.pk, artist) : null;
+      const creatorName = meId ? (await getCreatorName(meId.pk)) : undefined;
       const meta = {
         title, artist, license, rights: true, cover, tracks,
         comments: m?.comments,
         about: $<HTMLTextAreaElement>("#about").value.trim().slice(0, 2000) || undefined,
         artist_avatar: m?.artist_avatar ?? meProf?.avatar,
         artist_bio: m?.artist_bio ?? meProf?.bio,
+        creator: creatorName || undefined,
       };
       msg.textContent = edit ? "Saving..." : "Publishing the release...";
       let instance: string, params: string;
@@ -1217,7 +1357,7 @@ async function releaseForm(existing?: Release) {
       indexReleaseTracks(instance, params, { ...meta, ts: Date.now() });
 
       const hash = `#/r/${instance}.${params}`;
-      await saveRelease({ title, artist, hash, cover: cover?.addr });
+      await saveRelease({ title, artist, hash, cover: cover?.addr, creator: creatorName || undefined });
       await addMyArtist(artist);
       await storePut("artist", artist);
       if ($<HTMLInputElement>("#list")?.checked) {
@@ -1252,6 +1392,7 @@ async function releasePage(instance: string, params: string, track = -1) {
   const total = m.tracks.reduce((n, t) => n + t.chunks.reduce((s, c) => s + c.ms, 0), 0);
   const initialTrackIdx = track >= 0 && track < m.tracks.length ? track : 0;
   const initialTrack = m.tracks[initialTrackIdx];
+  const relCreator = m.creator || (await getCreatorName(params.slice(0, 64))) || `${personaName(params.slice(0, 64)).slice(0, 8)}…`;
 
   app.innerHTML = `
     <p><a href="#/">← All releases</a></p>
@@ -1341,7 +1482,7 @@ async function releasePage(instance: string, params: string, track = -1) {
           </div>
           ${m.artist_bio ? `<p class="muted" style="font-size:0.84rem; margin:6px 0 2px; line-height:1.4;">${esc(m.artist_bio)}</p>` : "" }
           <div class="chips">
-            <a class="chip" href="#/a/${esc(params.slice(0, 64))}" title="View creator hub for this publisher">Creator ${esc(personaName(params.slice(0, 64)).slice(0, 8))}…</a>
+            <a class="chip" href="#/a/${esc(params.slice(0, 64))}" title="View creator hub for this publisher">Creator ${esc(relCreator)}</a>
             ${isMaintainer(params.slice(0, 64)) ? `<span class="chip" style="background:#00a8ff; color:#fff; font-weight:700;" title="FreeTunes Creator & Maintainer">Maintainer</span>` : ""}
             ${isModerator(params.slice(0, 64)) && !isMaintainer(params.slice(0, 64)) ? `<span class="chip" style="background:#00a878; color:#fff; font-weight:700;" title="FreeTunes Moderator">Moderator</span>` : ""}
           </div>
@@ -1405,7 +1546,7 @@ async function releasePage(instance: string, params: string, track = -1) {
     if (otherProjects.length) {
       const distinctOther = Array.from(new Set(otherProjects.map(([, e]) => e.artist.trim())));
       discoHtml += `
-        <div class="bc-disco-title" style="margin-top:14px;">More from this creator</div>
+        <div class="bc-disco-title" style="margin-top:14px;">More from ${esc(m.creator || "this creator")}</div>
         <div class="chips" style="margin-top:6px;">
           ${distinctOther.slice(0, 3).map((a) => `
             <a class="chip" href="#/a/${esc(pk)}/${encodeURIComponent(a)}">${esc(a)}</a>
@@ -1744,6 +1885,7 @@ async function identityPage() {
 
   const myArtists = await getMyArtists();
   const defaultArtist = (await storeGet("artist")) ?? (myArtists[0] || "");
+  const currentCreatorName = (await getCreatorName(me.pk)) || "";
   const key = await localIdentityKey();
   box.innerHTML = `
     <div class="card">
@@ -1752,6 +1894,19 @@ async function identityPage() {
       <div class="actions">
         <a class="btn primary" href="#/a/${esc(me.pk)}">Your Creator Hub</a>
         <a class="btn" href="#/publish">Publish a release</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Creator & Publisher Profile</h2>
+      <p class="muted"><small>Set your public creator name for this persona (shown on your Creator Hub, discography, and in Radica).</small></p>
+      <label class="field" style="margin-top:14px;">
+        <span>Creator name</span>
+        <input id="creator-name-field" maxlength="80" value="${esc(currentCreatorName)}" placeholder="e.g. Scobru, Blue Records, etc." />
+      </label>
+      <div class="actions">
+        <button id="save-creator-name" type="button">Save creator name</button>
+        <span id="creator-save-msg" class="muted"></span>
       </div>
     </div>
 
@@ -1793,6 +1948,22 @@ async function identityPage() {
       <p class="muted">This node forgets the sign-in. Your releases stay yours: sign in again, here or on another node, to edit them.</p>
       <div class="actions"><button id="out" type="button">Sign out</button></div>
     </div>`;
+
+  $("#save-creator-name").onclick = async () => {
+    const val = $<HTMLInputElement>("#creator-name-field").value.trim();
+    const btn = $<HTMLButtonElement>("#save-creator-name");
+    const msg = $<HTMLElement>("#creator-save-msg");
+    btn.disabled = true;
+    try {
+      await setCreatorName(val, me!.pk);
+      msg.textContent = "Saved.";
+      setTimeout(() => { msg.textContent = ""; }, 2000);
+    } catch (e) {
+      msg.textContent = `Could not save: ${esc(String(e))}`;
+    } finally {
+      btn.disabled = false;
+    }
+  };
   $("#savename").onclick = async () => {
     const val = $<HTMLInputElement>("#name").value.trim();
     if (val) {
