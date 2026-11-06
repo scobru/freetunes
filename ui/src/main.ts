@@ -6,6 +6,7 @@ import {
   watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE,
   FREETUNES_MAINTAINER, FREETUNES_DEFAULT_MODS, isMaintainer, isModerator,
   type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta, type ReleaseMeta,
+  type DirEntry,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -49,8 +50,8 @@ function route() {
     const raw = h.slice(8).replace(/^\/?(\?q=)?/, "");
     return searchPage(decodeURIComponent(raw));
   }
-  const ar = h.match(/^#\/a\/([0-9a-f]{64})$/);
-  if (ar) return artistPage(ar[1]);
+  const ar = h.match(/^#\/a\/([0-9a-f]{64})(?:\/(.+))?$/);
+  if (ar) return artistPage(ar[1], ar[2] ? decodeURIComponent(ar[2]) : undefined);
   const m = h.match(/^#\/(r|edit)\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96,})(?:\/(\d+))?$/);
   if (m?.[1] === "edit") return editPage(m[2], m[3]);
   return m ? releasePage(m[2], m[3], m[4] ? Number(m[4]) : -1) : explore();
@@ -81,8 +82,8 @@ function lazyCovers(root: ParentNode) {
   root.querySelectorAll<HTMLImageElement>("img[data-cover]").forEach((i) => io.observe(i));
 }
 
-const card = (hash: string, id: string, title: string, artist: string, cover?: string, extra = "") =>
-  `<a class="rel" href="${esc(hash)}">${art(id, title, cover)}<b>${esc(title)}</b><small>${esc(artist)}${extra}</small></a>`;
+const card = (hash: string, id: string, title: string, artist: string, cover?: string, extra = "", extraAttr = "") =>
+  `<a class="rel" href="${esc(hash)}" ${extraAttr}>${art(id, title, cover)}<b>${esc(title)}</b><small>${esc(artist)}${extra}</small></a>`;
 
 // ---------------- track caching & indexing for instant search ----------------
 interface CachedTrack {
@@ -134,35 +135,100 @@ export interface ArtistProfile {
 
 const profileCache = new Map<string, ArtistProfile>();
 
-export async function getArtistProfile(pk: string): Promise<ArtistProfile | null> {
-  if (profileCache.has(pk)) return profileCache.get(pk)!;
+export function artistProfileKey(pk: string, artistName?: string): string {
+  const norm = artistName?.trim().toLowerCase();
+  return norm ? `profile:${pk}:${norm}` : `profile:${pk}`;
+}
+
+export async function getArtistProfile(pk: string, artistName?: string): Promise<ArtistProfile | null> {
+  const key = artistProfileKey(pk, artistName);
+  if (profileCache.has(key)) return profileCache.get(key)!;
   try {
-    const raw = await storeGet(`profile:${pk}`);
+    const raw = await storeGet(key);
     if (raw) {
       const p = JSON.parse(raw) as ArtistProfile;
-      profileCache.set(pk, p);
+      profileCache.set(key, p);
       return p;
     }
   } catch {}
   try {
-    const raw = localStorage.getItem(`ft-profile-${pk}`);
+    const raw = localStorage.getItem(`ft-${key}`);
     if (raw) {
       const p = JSON.parse(raw) as ArtistProfile;
-      profileCache.set(pk, p);
+      profileCache.set(key, p);
       return p;
     }
   } catch {}
+
+  // Fallback to legacy profile:pk if specific artist profile was not found
+  if (artistName) {
+    try {
+      const legacyRaw = (await storeGet(`profile:${pk}`)) || localStorage.getItem(`ft-profile-${pk}`);
+      if (legacyRaw) {
+        const p = JSON.parse(legacyRaw) as ArtistProfile;
+        if (!p.name || p.name.trim().toLowerCase() === artistName.trim().toLowerCase()) {
+          return p;
+        }
+      }
+    } catch {}
+  }
   return null;
 }
 
-export async function saveArtistProfile(pk: string, prof: Partial<ArtistProfile>): Promise<ArtistProfile> {
-  const existing = await getArtistProfile(pk);
-  const merged: ArtistProfile = { ...existing, ...prof, updatedAt: Date.now() };
-  profileCache.set(pk, merged);
+export async function saveArtistProfile(
+  pk: string,
+  artistNameOrProf: string | Partial<ArtistProfile>,
+  maybeProf?: Partial<ArtistProfile>
+): Promise<ArtistProfile> {
+  let artistName: string | undefined;
+  let prof: Partial<ArtistProfile>;
+  if (typeof artistNameOrProf === "string") {
+    artistName = artistNameOrProf;
+    prof = maybeProf || {};
+  } else {
+    prof = artistNameOrProf;
+    artistName = prof.name;
+  }
+  const key = artistProfileKey(pk, artistName);
+  const existing = await getArtistProfile(pk, artistName);
+  const merged: ArtistProfile = { ...existing, ...prof, name: prof.name || artistName || existing?.name, updatedAt: Date.now() };
+  profileCache.set(key, merged);
   const str = JSON.stringify(merged);
-  try { localStorage.setItem(`ft-profile-${pk}`, str); } catch {}
-  try { await storePut(`profile:${pk}`, str); } catch {}
+  try { localStorage.setItem(`ft-${key}`, str); } catch {}
+  try { await storePut(key, str); } catch {}
+  // Also keep generic profile:pk updated if none set
+  try {
+    const gen = await storeGet(`profile:${pk}`);
+    if (!gen) await storePut(`profile:${pk}`, str);
+  } catch {}
   return merged;
+}
+
+// ---------------- creator managed artists ----------------
+export async function getMyArtists(): Promise<string[]> {
+  const set = new Set<string>();
+  try {
+    const raw = await storeGet("my-artists");
+    if (raw) {
+      for (const a of JSON.parse(raw)) if (typeof a === "string" && a.trim()) set.add(a.trim());
+    }
+  } catch {}
+  for (const r of await myReleases()) {
+    if (r.artist?.trim()) set.add(r.artist.trim());
+  }
+  const defaultArtist = await storeGet("artist");
+  if (defaultArtist?.trim()) set.add(defaultArtist.trim());
+  return Array.from(set);
+}
+
+export async function addMyArtist(name: string) {
+  const norm = name.trim();
+  if (!norm) return;
+  const current = await getMyArtists();
+  if (!current.some((a) => a.toLowerCase() === norm.toLowerCase())) {
+    current.push(norm);
+    try { await storePut("my-artists", JSON.stringify(current)); } catch {}
+  }
 }
 
 // ---------------- my releases (kept by the identity delegate, or localStorage as a fallback) ----------------
@@ -178,16 +244,18 @@ async function searchCatalog(query: string) {
   const dir = await loadDirectory().catch(() => ({ entries: {}, blocked: { ts: 0, list: [], sig: "" } }));
   const rows = Object.entries(dir.entries).filter(([, e]) => !e.removed);
 
-  // Group by artist
+  // Group by artist (pk + artist name)
   const artistMap = new Map<string, { pk: string; name: string; releases: typeof rows; latestCover?: string; latestTs: number }>();
   for (const [id, e] of rows) {
     const pk = e.params.slice(0, 64);
-    const ex = artistMap.get(pk);
+    const aName = e.artist.trim();
+    const aKey = `${pk}::${aName.toLowerCase()}`;
+    const ex = artistMap.get(aKey);
     if (!ex) {
-      artistMap.set(pk, { pk, name: e.artist, releases: [[id, e]], latestCover: e.cover, latestTs: e.ts });
+      artistMap.set(aKey, { pk, name: aName, releases: [[id, e]], latestCover: e.cover, latestTs: e.ts });
     } else {
       ex.releases.push([id, e]);
-      if (e.ts > ex.latestTs) { ex.latestTs = e.ts; ex.name = e.artist; if (e.cover) ex.latestCover = e.cover; }
+      if (e.ts > ex.latestTs) { ex.latestTs = e.ts; if (e.cover) ex.latestCover = e.cover; }
     }
   }
 
@@ -235,7 +303,7 @@ function initHeaderSearch() {
             <div class="quick-section">
               <span class="quick-label">Artists</span>
               ${artists.slice(0, 3).map((a) => `
-                <a class="quick-item" href="#/a/${esc(a.pk)}">
+                <a class="quick-item" href="#/a/${esc(a.pk)}/${encodeURIComponent(a.name)}">
                   <span class="quick-dot">●</span>
                   <b>${esc(a.name)}</b>
                   <small class="muted">${a.releases.length} rel</small>
@@ -356,15 +424,16 @@ async function artistsPage() {
 
     for (const [id, e] of rows) {
       const pk = e.params.slice(0, 64);
-      let a = artists.get(pk);
+      const aName = e.artist.trim();
+      const aKey = `${pk}::${aName.toLowerCase()}`;
+      let a = artists.get(aKey);
       if (!a) {
-        a = { pk, name: e.artist, releases: [], latestTs: e.ts, latestCover: e.cover };
-        artists.set(pk, a);
+        a = { pk, name: aName, releases: [], latestTs: e.ts, latestCover: e.cover };
+        artists.set(aKey, a);
       }
       a.releases.push({ id, params: e.params, title: e.title, cover: e.cover, ts: e.ts });
       if (e.ts > a.latestTs) {
         a.latestTs = e.ts;
-        a.name = e.artist;
         if (e.cover) a.latestCover = e.cover;
       }
     }
@@ -372,14 +441,14 @@ async function artistsPage() {
     const artistList = Array.from(artists.values()).sort((a, b) => b.releases.length - a.releases.length || b.latestTs - a.latestTs);
     const profMap = new Map<string, ArtistProfile>();
     await Promise.all(artistList.map(async (a) => {
-      const p = await getArtistProfile(a.pk);
-      if (p) profMap.set(a.pk, p);
+      const p = await getArtistProfile(a.pk, a.name);
+      if (p) profMap.set(`${a.pk}::${a.name.toLowerCase()}`, p);
     }));
 
     const render = (filter = "") => {
       const f = filter.toLowerCase().trim();
       const filtered = artistList.filter((a) => {
-        const p = profMap.get(a.pk);
+        const p = profMap.get(`${a.pk}::${a.name.toLowerCase()}`);
         const nm = p?.name || a.name;
         return nm.toLowerCase().includes(f) || a.pk.startsWith(f);
       });
@@ -391,13 +460,13 @@ async function artistsPage() {
       box.innerHTML = `
         <div class="artists-grid">
           ${filtered.map((a) => {
-            const p = profMap.get(a.pk);
+            const p = profMap.get(`${a.pk}::${a.name.toLowerCase()}`);
             const aName = p?.name || a.name;
             const aAvatar = p?.avatar || a.latestCover;
             return `
-            <a class="artist-card card" href="#/a/${esc(a.pk)}">
+            <a class="artist-card card" href="#/a/${esc(a.pk)}/${encodeURIComponent(a.name)}">
               <div class="artist-card-top">
-                <div class="artist-avatar" style="--h:${hueOf(a.pk)}">
+                <div class="artist-avatar" style="--h:${hueOf(a.pk + a.name)}">
                   ${aAvatar ? `<img data-cover="${esc(aAvatar)}" alt="" />` : ""}
                   <span>${esc((aName.trim()[0] ?? "A").toUpperCase())}</span>
                 </div>
@@ -405,7 +474,7 @@ async function artistsPage() {
                   <h3 class="artist-card-name">${esc(aName)}</h3>
                   <div class="chips">
                     <span class="chip hot">${a.releases.length} release${a.releases.length === 1 ? "" : "s"}</span>
-                    <span class="chip" title="${esc(a.pk)}">key ${esc(a.pk.slice(0, 8))}…</span>
+                    <span class="chip" title="Publisher: ${esc(a.pk)}">by ${esc(personaName(a.pk).slice(0, 6))}…</span>
                   </div>
                 </div>
               </div>
@@ -493,9 +562,9 @@ async function searchPage(initialQuery = "") {
         <h3 class="search-group-title">Artists <span class="search-group-count">(${artists.length})</span></h3>
         <div class="artists-grid">
           ${artists.map((a) => `
-            <a class="artist-card card" href="#/a/${esc(a.pk)}">
+            <a class="artist-card card" href="#/a/${esc(a.pk)}/${encodeURIComponent(a.name)}">
               <div class="artist-card-top">
-                <div class="artist-avatar" style="--h:${hueOf(a.pk)}">
+                <div class="artist-avatar" style="--h:${hueOf(a.pk + a.name)}">
                   ${a.latestCover ? `<img data-cover="${esc(a.latestCover)}" alt="" />` : ""}
                   <span>${esc((a.name.trim()[0] ?? "A").toUpperCase())}</span>
                 </div>
@@ -587,8 +656,8 @@ async function searchPage(initialQuery = "") {
   void runSearch();
 }
 
-// ---------------- artist page: directory entries signed by one key ----------------
-async function artistPage(pk: string) {
+// ---------------- artist & creator pages ----------------
+async function artistPage(pk: string, specificArtist?: string) {
   app.innerHTML = `<p class="muted">Loading... (the first visit on a node can take up to 30 s)</p>`;
   try {
     const [dir, me] = await Promise.all([loadDirectory(), peekIdentity()]);
@@ -597,188 +666,354 @@ async function artistPage(pk: string) {
     const listed = new Set(rows.map(([id]) => id));
     const unlisted = yours ? (await myReleases()).filter((r) => !listed.has(idOfHash(r.hash))) : [];
 
-    // Load profile: check local store, then inspect latest release if available
-    let prof = await getArtistProfile(pk);
-    let releaseWithProfile: Release | null = null;
-    if (rows.length > 0) {
-      try {
-        releaseWithProfile = await loadRelease(rows[0][0], rows[0][1].params);
-        if (releaseWithProfile.meta.artist_avatar || releaseWithProfile.meta.artist_bio) {
-          prof = await saveArtistProfile(pk, {
-            avatar: prof?.avatar || releaseWithProfile.meta.artist_avatar,
-            bio: prof?.bio || releaseWithProfile.meta.artist_bio,
-            name: prof?.name || releaseWithProfile.meta.artist,
-          });
-        }
-      } catch {}
+    const artistNameSet = new Set<string>();
+    for (const [, e] of rows) if (e.artist?.trim()) artistNameSet.add(e.artist.trim());
+    for (const r of unlisted) if (r.artist?.trim()) artistNameSet.add(r.artist.trim());
+    if (yours) {
+      for (const a of await getMyArtists()) if (a.trim()) artistNameSet.add(a.trim());
+    }
+    const allArtists = Array.from(artistNameSet);
+
+    const matchedArtist = specificArtist
+      ? allArtists.find((a) => a.toLowerCase() === specificArtist.toLowerCase()) || specificArtist
+      : (allArtists.length === 1 ? allArtists[0] : null);
+
+    if (!matchedArtist && allArtists.length > 1) {
+      return renderCreatorHub(pk, rows, unlisted, allArtists, yours);
     }
 
-    const name = prof?.name || (rows[0]?.[1].artist ?? unlisted[0]?.artist ?? (yours ? (await storeGet("artist")) : null) ?? "Unknown artist");
-    const avatarAddr = prof?.avatar || rows[0]?.[1].cover;
-    const bio = prof?.bio || "";
-    let avatarFile: File | undefined;
-    let removeAvatar = false;
+    const artistName = matchedArtist || (rows[0]?.[1].artist ?? unlisted[0]?.artist ?? (yours ? (await storeGet("artist")) : null) ?? "Unknown artist");
+    return renderSingleArtist(pk, artistName, rows, unlisted, allArtists, yours);
+  } catch (e) {
+    app.innerHTML = `<p class="err">Could not load the artist: ${esc(String(e))}</p>`;
+  }
+}
 
-    app.innerHTML = `
-      <p><a href="#/artists">← All artists</a></p>
-      <div class="bc-section-header">
-        <div style="display:flex; align-items:center; gap:18px;">
-          <div class="artist-avatar" id="artist-header-avatar" style="--h:${hueOf(pk)}; width:80px; height:80px; font-size:2rem;">
-            ${avatarAddr ? `<img data-cover="${esc(avatarAddr)}" alt="" />` : ""}
-            <span>${esc((name.trim()[0] ?? "A").toUpperCase())}</span>
-          </div>
-          <div>
-            <p class="eyebrow" style="margin-bottom:2px;">Artist</p>
-            <h1 style="margin-bottom:4px;" id="artist-header-name">${esc(name)}</h1>
-            <div class="chips">
-              <span class="chip hot">${rows.length + unlisted.length} release${rows.length + unlisted.length === 1 ? "" : "s"}</span>
-              <span class="chip" title="${esc(pk)}">key ${esc(pk.slice(0, 8))}…</span>
-              ${isMaintainer(pk) ? `<span class="chip" style="background:#00a8ff; color:#fff; font-weight:700;" title="FreeTunes Creator & Maintainer">Maintainer</span>` : ""}
-              ${isModerator(pk) && !isMaintainer(pk) ? `<span class="chip" style="background:#00a878; color:#fff; font-weight:700;" title="FreeTunes Moderator">Moderator</span>` : ""}
-              ${yours ? `<span class="chip hot">you</span>` : ""}
-              ${yours ? `<button type="button" class="btn small" id="edit-profile-btn" style="margin-left:6px;">Edit Profile</button>` : ""}
-            </div>
+async function renderCreatorHub(
+  pk: string,
+  rows: [string, DirEntry][],
+  unlisted: Saved[],
+  allArtists: string[],
+  yours: boolean
+) {
+  const creatorName = (yours ? (await storeGet("creator-name")) : null) || personaName(pk);
+  const totalReleases = rows.length + unlisted.length;
+
+  const artistProfiles = new Map<string, ArtistProfile | null>();
+  await Promise.all(allArtists.map(async (a) => {
+    artistProfiles.set(a.toLowerCase(), await getArtistProfile(pk, a));
+  }));
+
+  app.innerHTML = `
+    <p><a href="#/artists">← All artists</a></p>
+    <div class="bc-section-header">
+      <div style="display:flex; align-items:center; gap:18px;">
+        <div class="artist-avatar" style="--h:${hueOf(pk)}; width:80px; height:80px; font-size:2rem;">
+          <span>${esc((creatorName.trim()[0] ?? "C").toUpperCase())}</span>
+        </div>
+        <div>
+          <p class="eyebrow" style="margin-bottom:2px;">Creator & Publisher</p>
+          <h1 style="margin-bottom:4px;" id="creator-header-name">${esc(creatorName)}</h1>
+          <div class="chips">
+            <span class="chip hot">${allArtists.length} artist${allArtists.length === 1 ? "" : "s"}</span>
+            <span class="chip">${totalReleases} release${totalReleases === 1 ? "" : "s"}</span>
+            <span class="chip" title="${esc(pk)}">key ${esc(pk.slice(0, 8))}…</span>
+            ${isMaintainer(pk) ? `<span class="chip" style="background:#00a8ff; color:#fff; font-weight:700;" title="FreeTunes Creator & Maintainer">Maintainer</span>` : ""}
+            ${isModerator(pk) && !isMaintainer(pk) ? `<span class="chip" style="background:#00a878; color:#fff; font-weight:700;" title="FreeTunes Moderator">Moderator</span>` : ""}
+            ${yours ? `<span class="chip hot">you</span>` : ""}
           </div>
         </div>
       </div>
+    </div>
 
-      ${yours ? `
-        <div class="card profile-editor-card" id="profile-editor" hidden>
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-            <h3 style="margin:0;">Edit Artist Profile</h3>
-            <button type="button" class="btn small" id="prof-close-btn">✕</button>
-          </div>
-          <p class="muted"><small>Customize your public artist avatar and bio. Saved to your identity and your published releases on Freenet.</small></p>
-
-          <div class="profile-avatar-pick">
-            <div id="prof-avatar-prev" class="artist-avatar" style="--h:${hueOf(pk)}; width:74px; height:74px; font-size:1.8rem;">
-              ${avatarAddr ? `<img data-cover="${esc(avatarAddr)}" class="on" alt="" />` : ""}
-              <span>${esc((name.trim()[0] ?? "A").toUpperCase())}</span>
+    <h2>Artists managed by ${esc(creatorName)}</h2>
+    <div class="artists-grid">
+      ${allArtists.map((aName) => {
+        const aRows = rows.filter(([, e]) => e.artist.trim().toLowerCase() === aName.toLowerCase());
+        const aUnlisted = unlisted.filter((r) => r.artist.trim().toLowerCase() === aName.toLowerCase());
+        const count = aRows.length + aUnlisted.length;
+        const prof = artistProfiles.get(aName.toLowerCase());
+        const aAvatar = prof?.avatar || aRows[0]?.[1].cover || aUnlisted[0]?.cover;
+        return `
+          <a class="artist-card card" href="#/a/${esc(pk)}/${encodeURIComponent(aName)}">
+            <div class="artist-card-top">
+              <div class="artist-avatar" style="--h:${hueOf(pk + aName)}">
+                ${aAvatar ? `<img data-cover="${esc(aAvatar)}" alt="" />` : ""}
+                <span>${esc((aName.trim()[0] ?? "A").toUpperCase())}</span>
+              </div>
+              <div class="artist-card-info">
+                <h3 class="artist-card-name">${esc(aName)}</h3>
+                <div class="chips">
+                  <span class="chip hot">${count} release${count === 1 ? "" : "s"}</span>
+                </div>
+              </div>
             </div>
-            <div>
-              <label class="btn small" style="cursor:pointer; display:inline-flex;">
-                Choose new avatar image
-                <input type="file" id="prof-avatar-file" accept="image/*" style="display:none;" />
-              </label>
-              ${avatarAddr ? `<button type="button" class="btn small danger" id="prof-avatar-remove" style="margin-left:8px;">Reset avatar</button>` : ""}
-              <p class="muted" style="margin-top:6px;"><small>Square photo or artwork. Automatically resized to 600 px.</small></p>
-            </div>
-          </div>
+            ${aRows.length ? `
+              <div class="artist-card-disco">
+                ${aRows.slice(0, 4).map(([id, r]) => `
+                  <div class="artist-disco-thumb" title="${esc(r.title)}">
+                    ${art(id, r.title, r.cover, "mini-art")}
+                  </div>
+                `).join("")}
+              </div>
+            ` : ""}
+          </a>`;
+      }).join("")}
+    </div>
 
-          <label class="field">
-            <span>Artist Name</span>
-            <input id="prof-name" maxlength="80" value="${esc(name)}" placeholder="Your artist or band name" />
-          </label>
+    <h2>All Releases</h2>
+    <div class="search-tabs" id="creator-tabs" style="margin-top:12px;">
+      <button type="button" class="search-tab on" data-filter="all">All releases <span class="tab-count">(${totalReleases})</span></button>
+      ${allArtists.map((aName) => {
+        const aRows = rows.filter(([, e]) => e.artist.trim().toLowerCase() === aName.toLowerCase());
+        const aUnlisted = unlisted.filter((r) => r.artist.trim().toLowerCase() === aName.toLowerCase());
+        const count = aRows.length + aUnlisted.length;
+        return `<button type="button" class="search-tab" data-filter="${esc(aName.toLowerCase())}">${esc(aName)} <span class="tab-count">(${count})</span></button>`;
+      }).join("")}
+    </div>
 
-          <label class="field">
-            <span>Artist Bio & Info</span>
-            <textarea id="prof-bio" rows="4" maxlength="2000" placeholder="Write about yourself, musical background, influences, social links, location...">${esc(bio)}</textarea>
-          </label>
+    <div class="grid" id="creator-rel-grid">
+      ${rows.map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover, ` · ${new Date(e.ts).toLocaleDateString()}`, `data-artist="${esc(e.artist.trim().toLowerCase())}"`)).join("")}
+      ${unlisted.map((r) => card(r.hash, idOfHash(r.hash), r.title, r.artist, r.cover, " · not listed", `data-artist="${esc(r.artist.trim().toLowerCase())}"`)).join("")}
+    </div>
 
-          <div class="actions">
-            <button type="button" class="btn primary" id="prof-save-btn">Save profile</button>
-            <button type="button" class="btn" id="prof-cancel-btn">Cancel</button>
-            <span id="prof-msg" class="muted"></span>
-          </div>
-        </div>
-      ` : ""}
+    <label class="field share" style="margin-top:24px;"><span>Link to share creator hub</span><input readonly value="${esc(pageUrl(`#/a/${pk}`))}" onfocus="this.select()" /></label>
+  `;
 
-      ${bio ? `
-        <div class="card bc-artist-bio">
-          <h3 class="bc-subhead" style="margin-top:0;">About ${esc(name)}</h3>
-          <p>${esc(bio)}</p>
-        </div>
-      ` : ""}
+  lazyCovers(app);
 
-      <h2>Releases</h2>
-      ${rows.length + unlisted.length ? `<div class="grid">${rows.map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover, ` · ${new Date(e.ts).toLocaleDateString()}`)).join("")}${unlisted.map((r) => card(r.hash, idOfHash(r.hash), r.title, r.artist, r.cover, " · not listed")).join("")}</div>`
-        : `<div class="empty">No releases listed in the directory for this artist.</div>`}
-      <label class="field share"><span>Link to share</span><input readonly value="${esc(pageUrl(`#/a/${pk}`))}" onfocus="this.select()" /></label>
-      <p class="notice">Only releases listed in the public directory appear here. The page is identified by the artist's key, not by the name.</p>`;
-
-    lazyCovers(app);
-
-    if (yours) {
-      const editBtn = $<HTMLButtonElement>("#edit-profile-btn");
-      const editor = $<HTMLElement>("#profile-editor");
-      const closeBtn = $<HTMLButtonElement>("#prof-close-btn");
-      const cancelBtn = $<HTMLButtonElement>("#prof-cancel-btn");
-      const saveBtn = $<HTMLButtonElement>("#prof-save-btn");
-      const fileInput = $<HTMLInputElement>("#prof-avatar-file");
-      const removeBtn = app.querySelector<HTMLButtonElement>("#prof-avatar-remove");
-      const prevBox = $("#prof-avatar-prev");
-      const msg = $("#prof-msg");
-
-      const toggleEditor = () => {
-        editor.hidden = !editor.hidden;
-        if (!editor.hidden) editor.scrollIntoView({ behavior: "smooth", block: "center" });
-      };
-      editBtn.onclick = toggleEditor;
-      closeBtn.onclick = () => (editor.hidden = true);
-      cancelBtn.onclick = () => (editor.hidden = true);
-
-      fileInput.onchange = (e) => {
-        avatarFile = (e.target as HTMLInputElement).files?.[0];
-        if (avatarFile) {
-          removeAvatar = false;
-          prevBox.innerHTML = `<img src="${URL.createObjectURL(avatarFile)}" class="on" alt="" style="width:100%; height:100%; object-fit:cover; border-radius:50%;" />`;
+  const tabs = app.querySelectorAll<HTMLButtonElement>("#creator-tabs .search-tab");
+  const relCards = app.querySelectorAll<HTMLElement>("#creator-rel-grid .rel");
+  tabs.forEach((tab) => {
+    tab.onclick = () => {
+      tabs.forEach((t) => t.classList.remove("on"));
+      tab.classList.add("on");
+      const filter = tab.dataset.filter || "all";
+      relCards.forEach((c) => {
+        if (filter === "all" || c.dataset.artist === filter) {
+          c.hidden = false;
+        } else {
+          c.hidden = true;
         }
-      };
+      });
+    };
+  });
+}
 
-      if (removeBtn) {
-        removeBtn.onclick = () => {
-          removeAvatar = true;
-          avatarFile = undefined;
-          prevBox.innerHTML = `<span>${esc((name.trim()[0] ?? "A").toUpperCase())}</span>`;
-        };
+async function renderSingleArtist(
+  pk: string,
+  artistName: string,
+  rows: [string, DirEntry][],
+  unlisted: Saved[],
+  allArtists: string[],
+  yours: boolean
+) {
+  const artistRows = rows.filter(([, e]) => e.artist.trim().toLowerCase() === artistName.toLowerCase());
+  const artistUnlisted = unlisted.filter((r) => r.artist.trim().toLowerCase() === artistName.toLowerCase());
+  const totalReleases = artistRows.length + artistUnlisted.length;
+
+  let prof = await getArtistProfile(pk, artistName);
+  let releaseWithProfile: Release | null = null;
+  if (artistRows.length > 0) {
+    try {
+      releaseWithProfile = await loadRelease(artistRows[0][0], artistRows[0][1].params);
+      if (releaseWithProfile.meta.artist_avatar || releaseWithProfile.meta.artist_bio) {
+        prof = await saveArtistProfile(pk, artistName, {
+          avatar: prof?.avatar || releaseWithProfile.meta.artist_avatar,
+          bio: prof?.bio || releaseWithProfile.meta.artist_bio,
+          name: prof?.name || artistName,
+        });
       }
+    } catch {}
+  }
 
-      saveBtn.onclick = async () => {
-        saveBtn.disabled = true;
-        msg.textContent = "Saving...";
-        try {
-          let newAvatarAddr = removeAvatar ? undefined : prof?.avatar;
-          if (avatarFile) {
-            msg.textContent = "Uploading avatar to Freenet...";
-            const bytes = await makeCover(avatarFile);
-            newAvatarAddr = await putChunk(bytes);
-            await flushKnown();
-          }
+  const name = prof?.name || artistName;
+  const avatarAddr = prof?.avatar || artistRows[0]?.[1].cover || artistUnlisted[0]?.cover;
+  const bio = prof?.bio || "";
+  let avatarFile: File | undefined;
+  let removeAvatar = false;
 
-          const newName = $<HTMLInputElement>("#prof-name").value.trim() || name;
-          const newBio = $<HTMLTextAreaElement>("#prof-bio").value.trim();
+  const otherArtists = allArtists.filter((a) => a.toLowerCase() !== artistName.toLowerCase());
 
-          await saveArtistProfile(pk, { avatar: newAvatarAddr, bio: newBio, name: newName });
-          await storePut("artist", newName);
+  app.innerHTML = `
+    <p><a href="#/artists">← All artists</a></p>
+    <div class="bc-section-header">
+      <div style="display:flex; align-items:center; gap:18px;">
+        <div class="artist-avatar" id="artist-header-avatar" style="--h:${hueOf(pk + name)}; width:80px; height:80px; font-size:2rem;">
+          ${avatarAddr ? `<img data-cover="${esc(avatarAddr)}" alt="" />` : ""}
+          <span>${esc((name.trim()[0] ?? "A").toUpperCase())}</span>
+        </div>
+        <div>
+          <p class="eyebrow" style="margin-bottom:2px;">Artist</p>
+          <h1 style="margin-bottom:4px;" id="artist-header-name">${esc(name)}</h1>
+          <div class="chips">
+            <span class="chip hot">${totalReleases} release${totalReleases === 1 ? "" : "s"}</span>
+            <a class="chip" href="#/a/${esc(pk)}" title="Publisher key: ${esc(pk)}">Creator ${esc(personaName(pk).slice(0, 8))}…</a>
+            ${isMaintainer(pk) ? `<span class="chip" style="background:#00a8ff; color:#fff; font-weight:700;" title="FreeTunes Creator & Maintainer">Maintainer</span>` : ""}
+            ${isModerator(pk) && !isMaintainer(pk) ? `<span class="chip" style="background:#00a878; color:#fff; font-weight:700;" title="FreeTunes Moderator">Moderator</span>` : ""}
+            ${yours ? `<span class="chip hot">you</span>` : ""}
+            ${yours ? `<button type="button" class="btn small" id="edit-profile-btn" style="margin-left:6px;">Edit Profile</button>` : ""}
+          </div>
+        </div>
+      </div>
+    </div>
 
-          // Sync to latest release if one exists and is editable
-          if (rows.length > 0) {
-            msg.textContent = "Updating release with profile...";
-            try {
-              const [inst, entry] = rows[0];
-              const rel = releaseWithProfile || await loadRelease(inst, entry.params);
-              if (rel && !rel.legacy && !rel.meta.deleted) {
-                await updateRelease(inst, entry.params, {
-                  ...rel.meta,
-                  artist: newName,
-                  artist_avatar: newAvatarAddr,
-                  artist_bio: newBio,
-                }, rel.meta.ts);
-              }
-            } catch (e) {
-              console.warn("Could not sync profile to release:", e);
-            }
-          }
+    ${otherArtists.length > 0 ? `
+      <div class="creator-other-artists" style="margin:12px 0 18px; padding:10px 14px; background:var(--surface-2); border-radius:8px; border:1px solid var(--line); font-size:0.88rem; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <span class="muted">Other projects by this creator:</span>
+        ${otherArtists.map((oa) => `
+          <a class="chip" href="#/a/${esc(pk)}/${encodeURIComponent(oa)}" style="margin:0;"><b>${esc(oa)}</b></a>
+        `).join("")}
+        <a href="#/a/${esc(pk)}" style="margin-left:auto; color:var(--accent); font-weight:600; text-decoration:none;">View creator hub →</a>
+      </div>
+    ` : ""}
 
-          msg.textContent = "Profile saved!";
-          setTimeout(() => void artistPage(pk), 500);
-        } catch (e) {
-          msg.textContent = `Error: ${e}`;
-          saveBtn.disabled = false;
-        }
+    ${yours ? `
+      <div class="card profile-editor-card" id="profile-editor" hidden>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <h3 style="margin:0;">Edit Artist Profile for ${esc(name)}</h3>
+          <button type="button" class="btn small" id="prof-close-btn">✕</button>
+        </div>
+        <p class="muted"><small>Customize the public avatar and bio for this specific artist project.</small></p>
+
+        <div class="profile-avatar-pick">
+          <div id="prof-avatar-prev" class="artist-avatar" style="--h:${hueOf(pk + name)}; width:74px; height:74px; font-size:1.8rem;">
+            ${avatarAddr ? `<img data-cover="${esc(avatarAddr)}" class="on" alt="" />` : ""}
+            <span>${esc((name.trim()[0] ?? "A").toUpperCase())}</span>
+          </div>
+          <div>
+            <label class="btn small" style="cursor:pointer; display:inline-flex;">
+              Choose new avatar image
+              <input type="file" id="prof-avatar-file" accept="image/*" style="display:none;" />
+            </label>
+            ${avatarAddr ? `<button type="button" class="btn small danger" id="prof-avatar-remove" style="margin-left:8px;">Reset avatar</button>` : ""}
+            <p class="muted" style="margin-top:6px;"><small>Square photo or artwork. Automatically resized to 600 px.</small></p>
+          </div>
+        </div>
+
+        <label class="field">
+          <span>Artist Name</span>
+          <input id="prof-name" maxlength="80" value="${esc(name)}" placeholder="Your artist or band name" />
+        </label>
+
+        <label class="field">
+          <span>Artist Bio & Info</span>
+          <textarea id="prof-bio" rows="4" maxlength="2000" placeholder="Write about yourself, musical background, influences, social links, location...">${esc(bio)}</textarea>
+        </label>
+
+        <div class="actions">
+          <button type="button" class="btn primary" id="prof-save-btn">Save profile</button>
+          <button type="button" class="btn" id="prof-cancel-btn">Cancel</button>
+          <span id="prof-msg" class="muted"></span>
+        </div>
+      </div>
+    ` : ""}
+
+    ${bio ? `
+      <div class="card bc-artist-bio">
+        <h3 class="bc-subhead" style="margin-top:0;">About ${esc(name)}</h3>
+        <p>${esc(bio)}</p>
+      </div>
+    ` : ""}
+
+    <h2>Releases</h2>
+    ${totalReleases ? `
+      <div class="grid">
+        ${artistRows.map(([id, e]) => card(`#/r/${id}.${e.params}`, id, e.title, e.artist, e.cover, ` · ${new Date(e.ts).toLocaleDateString()}`)).join("")}
+        ${artistUnlisted.map((r) => card(r.hash, idOfHash(r.hash), r.title, r.artist, r.cover, " · not listed")).join("")}
+      </div>
+    ` : `<div class="empty">No releases listed in the directory for this artist.</div>`}
+
+    <label class="field share"><span>Link to share</span><input readonly value="${esc(pageUrl(`#/a/${pk}/${encodeURIComponent(name)}`))}" onfocus="this.select()" /></label>
+    <p class="notice">Releases listed in the public directory appear here. This artist is published by key <code>${esc(pk.slice(0, 16))}…</code></p>
+  `;
+
+  lazyCovers(app);
+
+  if (yours) {
+    const editBtn = $<HTMLButtonElement>("#edit-profile-btn");
+    const editor = $<HTMLElement>("#profile-editor");
+    const closeBtn = $<HTMLButtonElement>("#prof-close-btn");
+    const cancelBtn = $<HTMLButtonElement>("#prof-cancel-btn");
+    const saveBtn = $<HTMLButtonElement>("#prof-save-btn");
+    const fileInput = $<HTMLInputElement>("#prof-avatar-file");
+    const removeBtn = app.querySelector<HTMLButtonElement>("#prof-avatar-remove");
+    const prevBox = $("#prof-avatar-prev");
+    const msg = $("#prof-msg");
+
+    const toggleEditor = () => {
+      editor.hidden = !editor.hidden;
+      if (!editor.hidden) editor.scrollIntoView({ behavior: "smooth", block: "center" });
+    };
+    editBtn.onclick = toggleEditor;
+    closeBtn.onclick = () => (editor.hidden = true);
+    cancelBtn.onclick = () => (editor.hidden = true);
+
+    fileInput.onchange = (e) => {
+      avatarFile = (e.target as HTMLInputElement).files?.[0];
+      if (avatarFile) {
+        removeAvatar = false;
+        prevBox.innerHTML = `<img src="${URL.createObjectURL(avatarFile)}" class="on" alt="" style="width:100%; height:100%; object-fit:cover; border-radius:50%;" />`;
+      }
+    };
+
+    if (removeBtn) {
+      removeBtn.onclick = () => {
+        removeAvatar = true;
+        avatarFile = undefined;
+        prevBox.innerHTML = `<span>${esc((name.trim()[0] ?? "A").toUpperCase())}</span>`;
       };
     }
-  } catch (e) { app.innerHTML = `<p class="err">Could not load the artist: ${esc(String(e))}</p>`; }
+
+    saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      msg.textContent = "Saving...";
+      try {
+        let newAvatarAddr = removeAvatar ? undefined : prof?.avatar;
+        if (avatarFile) {
+          msg.textContent = "Uploading avatar to Freenet...";
+          const bytes = await makeCover(avatarFile);
+          newAvatarAddr = await putChunk(bytes);
+          await flushKnown();
+        }
+
+        const newName = $<HTMLInputElement>("#prof-name").value.trim() || name;
+        const newBio = $<HTMLTextAreaElement>("#prof-bio").value.trim();
+
+        await saveArtistProfile(pk, newName, { avatar: newAvatarAddr, bio: newBio, name: newName });
+        await addMyArtist(newName);
+
+        // Sync to latest release of this artist if available
+        if (artistRows.length > 0) {
+          msg.textContent = "Updating release with profile...";
+          try {
+            const [inst, entry] = artistRows[0];
+            const rel = releaseWithProfile || await loadRelease(inst, entry.params);
+            if (rel && !rel.legacy && !rel.meta.deleted) {
+              await updateRelease(inst, entry.params, {
+                ...rel.meta,
+                artist: newName,
+                artist_avatar: newAvatarAddr,
+                artist_bio: newBio,
+              }, rel.meta.ts);
+              if (entry && !entry.removed) {
+                msg.textContent = "Updating directory...";
+                await listRelease(inst, entry.params, rel.meta.title, newName, rel.meta.cover?.addr ?? "");
+              }
+            }
+          } catch (e) {
+            console.warn("Could not sync profile to release:", e);
+          }
+        }
+
+        msg.textContent = "Profile saved!";
+        setTimeout(() => void artistPage(pk, newName), 500);
+      } catch (e) {
+        msg.textContent = `Error: ${e}`;
+        saveBtn.disabled = false;
+      }
+    };
+  }
 }
 
 // ---------------- publish / edit ----------------
@@ -798,7 +1033,9 @@ async function editPage(instance: string, params: string) {
 }
 
 /** The form to publish a new release, or (with `existing`) to edit one you own. */
-function releaseForm(existing?: Release) {
+async function releaseForm(existing?: Release) {
+  const me = await peekIdentity();
+  const myArtists = me ? await getMyArtists() : [];
   const edit = !!existing, m = existing?.meta;
   const items: Item[] = (m?.tracks ?? []).map((t) => ({ kind: "old", title: t.title, chunks: t.chunks, size: t.chunks.reduce((n, c) => n + c.n, 0) }));
   let coverFile: File | undefined, removeCover = false;
@@ -813,7 +1050,23 @@ function releaseForm(existing?: Release) {
     <div class="card">
       <h2>Details</h2>
       <div class="cols">
-        <label class="field"><span>Artist</span><input id="artist" placeholder="Artist name" maxlength="80" value="${esc(m?.artist ?? "")}" /></label>
+        <div>
+          <label class="field">
+            <span>Artist</span>
+            <input id="artist" list="my-artists-list" placeholder="Artist or band name" maxlength="80" value="${esc(m?.artist ?? "")}" autocomplete="off" />
+            <datalist id="my-artists-list">
+              ${myArtists.map((a) => `<option value="${esc(a)}">`).join("")}
+            </datalist>
+          </label>
+          ${!edit && myArtists.length > 0 ? `
+            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:-6px; margin-bottom:12px;">
+              <small class="muted">Your artists:</small>
+              ${myArtists.map((a) => `
+                <button type="button" class="btn small artist-quick-pick" data-name="${esc(a)}" style="padding:2px 8px; font-size:0.78rem;">${esc(a)}</button>
+              `).join("")}
+            </div>
+          ` : ""}
+        </div>
         <label class="field"><span>Title</span><input id="title" placeholder="Release title" maxlength="120" value="${esc(m?.title ?? "")}" /></label>
       </div>
       <label class="field"><span>About this release (optional)</span>
@@ -847,7 +1100,16 @@ function releaseForm(existing?: Release) {
     <div class="actions"><button id="go" type="button" class="primary">${edit ? "Save changes" : "Publish"}</button><span id="msg" class="muted"></span></div>
     <progress id="bar" max="100" value="0" hidden></progress>`;
 
-  if (!edit) void storeGet("artist").then((a) => { if (a && !$<HTMLInputElement>("#artist").value) $<HTMLInputElement>("#artist").value = a; });
+  if (!edit && myArtists.length && !$<HTMLInputElement>("#artist").value) {
+    const saved = await storeGet("artist");
+    $<HTMLInputElement>("#artist").value = saved || myArtists[0];
+  }
+  app.querySelectorAll<HTMLButtonElement>(".artist-quick-pick").forEach((btn) => {
+    btn.onclick = () => {
+      const inp = $<HTMLInputElement>("#artist");
+      if (inp && btn.dataset.name) inp.value = btn.dataset.name;
+    };
+  });
   if (existing) {
     void loadDirectory().then((d) => {
       const e = d.entries[existing.instance];
@@ -936,7 +1198,7 @@ function releaseForm(existing?: Release) {
       }
       await flushKnown();
       const meId = await peekIdentity();
-      const meProf = meId ? await getArtistProfile(meId.pk) : null;
+      const meProf = meId ? await getArtistProfile(meId.pk, artist) : null;
       const meta = {
         title, artist, license, rights: true, cover, tracks,
         comments: m?.comments,
@@ -956,6 +1218,7 @@ function releaseForm(existing?: Release) {
 
       const hash = `#/r/${instance}.${params}`;
       await saveRelease({ title, artist, hash, cover: cover?.addr });
+      await addMyArtist(artist);
       await storePut("artist", artist);
       if ($<HTMLInputElement>("#list")?.checked) {
         msg.textContent = "Updating the public directory (a few seconds of proof-of-work)...";
@@ -997,7 +1260,7 @@ async function releasePage(instance: string, params: string, track = -1) {
       <div class="bc-main">
         <div class="bc-album-header">
           <h1 class="bc-title">${esc(m.title)}</h1>
-          <p class="bc-by">by <a href="#/a/${esc(params.slice(0, 64))}"><b>${esc(m.artist)}</b></a></p>
+          <p class="bc-by">by <a href="#/a/${esc(params.slice(0, 64))}/${encodeURIComponent(m.artist)}"><b>${esc(m.artist)}</b></a></p>
         </div>
 
         <!-- BANDCAMP EMBEDDED PLAYER -->
@@ -1067,19 +1330,20 @@ async function releasePage(instance: string, params: string, track = -1) {
 
         <div class="card bc-artist-card">
           <div class="bc-artist-header">
-            <div class="bc-artist-avatar" style="--h:${hueOf(params.slice(0, 64))}">
+            <div class="bc-artist-avatar" style="--h:${hueOf(params.slice(0, 64) + m.artist)}">
               ${(m.artist_avatar) ? `<img data-cover="${esc(m.artist_avatar)}" alt="" />` : ""}
               <span>${esc((m.artist.trim()[0] ?? "A").toUpperCase())}</span>
             </div>
             <div>
               <p class="eyebrow" style="margin:0 0 2px;">Artist</p>
-              <h4 class="bc-artist-name"><a href="#/a/${esc(params.slice(0, 64))}">${esc(m.artist)}</a></h4>
+              <h4 class="bc-artist-name"><a href="#/a/${esc(params.slice(0, 64))}/${encodeURIComponent(m.artist)}">${esc(m.artist)}</a></h4>
             </div>
           </div>
           ${m.artist_bio ? `<p class="muted" style="font-size:0.84rem; margin:6px 0 2px; line-height:1.4;">${esc(m.artist_bio)}</p>` : "" }
           <div class="chips">
-            <span class="chip" title="${esc(params.slice(0, 64))}">key ${esc(params.slice(0, 8))}…</span>
-            ${params.length > 96 ? `<span class="chip hot" title="Viso persona ${esc(personaName(params.slice(0, 64)))}">Viso ${esc(personaName(params.slice(0, 64)).slice(0, 8))}…</span>` : ""}
+            <a class="chip" href="#/a/${esc(params.slice(0, 64))}" title="View creator hub for this publisher">Creator ${esc(personaName(params.slice(0, 64)).slice(0, 8))}…</a>
+            ${isMaintainer(params.slice(0, 64)) ? `<span class="chip" style="background:#00a8ff; color:#fff; font-weight:700;" title="FreeTunes Creator & Maintainer">Maintainer</span>` : ""}
+            ${isModerator(params.slice(0, 64)) && !isMaintainer(params.slice(0, 64)) ? `<span class="chip" style="background:#00a878; color:#fff; font-weight:700;" title="FreeTunes Moderator">Moderator</span>` : ""}
           </div>
 
           <!-- DISCOGRAPHY PREVIEW -->
@@ -1113,22 +1377,45 @@ async function releasePage(instance: string, params: string, track = -1) {
   // Load other releases by this artist into sidebar discography
   void loadDirectory().then((dir) => {
     const pk = params.slice(0, 64);
-    const others = Object.entries(dir.entries)
-      .filter(([id, e]) => e.params.slice(0, 64) === pk && id !== instance && !e.removed)
+    const artistNorm = m.artist.trim().toLowerCase();
+    const sameArtistReleases = Object.entries(dir.entries)
+      .filter(([id, e]) => e.params.slice(0, 64) === pk && e.artist.trim().toLowerCase() === artistNorm && id !== instance && !e.removed)
       .sort(([, a], [, b]) => b.ts - a.ts);
+    const otherProjects = Object.entries(dir.entries)
+      .filter(([id, e]) => e.params.slice(0, 64) === pk && e.artist.trim().toLowerCase() !== artistNorm && !e.removed)
+      .sort(([, a], [, b]) => b.ts - a.ts);
+
     const disco = $("#bc-disco");
     if (!disco) return;
-    if (others.length) {
-      disco.innerHTML = `
-        <div class="bc-disco-title">Discography</div>
+
+    let discoHtml = "";
+    if (sameArtistReleases.length) {
+      discoHtml += `
+        <div class="bc-disco-title">More by ${esc(m.artist)}</div>
         <div class="bc-disco-grid">
-          ${others.slice(0, 6).map(([id, e]) => `
+          ${sameArtistReleases.slice(0, 6).map(([id, e]) => `
             <a class="bc-disco-item" href="#/r/${id}.${e.params}" title="${esc(e.title)}">
               ${art(id, e.title, e.cover)}
               <small>${esc(e.title)}</small>
             </a>
           `).join("")}
         </div>`;
+    }
+
+    if (otherProjects.length) {
+      const distinctOther = Array.from(new Set(otherProjects.map(([, e]) => e.artist.trim())));
+      discoHtml += `
+        <div class="bc-disco-title" style="margin-top:14px;">More from this creator</div>
+        <div class="chips" style="margin-top:6px;">
+          ${distinctOther.slice(0, 3).map((a) => `
+            <a class="chip" href="#/a/${esc(pk)}/${encodeURIComponent(a)}">${esc(a)}</a>
+          `).join("")}
+          <a class="chip" href="#/a/${esc(pk)}" title="Creator hub">All projects →</a>
+        </div>`;
+    }
+
+    if (discoHtml) {
+      disco.innerHTML = discoHtml;
       lazyCovers(disco);
     }
   }).catch(() => {});
@@ -1455,14 +1742,45 @@ async function identityPage() {
     return;
   }
 
-  const name = (await storeGet("artist")) ?? "";
+  const myArtists = await getMyArtists();
+  const defaultArtist = (await storeGet("artist")) ?? (myArtists[0] || "");
   const key = await localIdentityKey();
   box.innerHTML = `
     <div class="card">
       <h2>Signed in</h2>
       <p>${key ? "Identity" : "Viso persona"} <code title="${esc(me.pk)}">${esc(personaName(me.pk))}</code></p>
-      <label class="field"><span>Artist name</span><input id="name" maxlength="80" value="${esc(name)}" placeholder="Used as the default artist when you publish" /></label>
-      <div class="actions"><button id="savename" type="button">Save name</button><a class="btn primary" href="#/publish">Publish a release</a><a class="btn" href="#/a/${esc(me.pk)}">Your artist page</a><span id="nmsg" class="muted"></span></div>
+      <div class="actions">
+        <a class="btn primary" href="#/a/${esc(me.pk)}">Your Creator Hub</a>
+        <a class="btn" href="#/publish">Publish a release</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Your Artists & Aliases</h2>
+      <p class="muted"><small>You can publish music under multiple artist projects (bands, aliases, collaborations) with this account.</small></p>
+      ${myArtists.length ? `
+        <div style="display:flex; flex-direction:column; gap:10px; margin:14px 0;">
+          ${myArtists.map((a) => `
+            <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:var(--surface-2); border-radius:8px; border:1px solid var(--line);">
+              <div>
+                <b style="font-size:1.05rem;">${esc(a)}</b>
+              </div>
+              <div style="display:flex; gap:8px;">
+                <a class="btn small" href="#/a/${esc(me!.pk)}/${encodeURIComponent(a)}">View artist page</a>
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      ` : `<p class="muted">No artists created yet. When you publish a release, the artist name will appear here.</p>`}
+
+      <label class="field" style="margin-top:14px;">
+        <span>Default artist name</span>
+        <input id="name" maxlength="80" value="${esc(defaultArtist)}" placeholder="Used as the default artist when you publish" />
+      </label>
+      <div class="actions">
+        <button id="savename" type="button">Save default artist</button>
+        <span id="nmsg" class="muted"></span>
+      </div>
     </div>
     ${key ? `<div class="card">
       <h2>Back up your key</h2>
@@ -1475,7 +1793,14 @@ async function identityPage() {
       <p class="muted">This node forgets the sign-in. Your releases stay yours: sign in again, here or on another node, to edit them.</p>
       <div class="actions"><button id="out" type="button">Sign out</button></div>
     </div>`;
-  $("#savename").onclick = async () => { await storePut("artist", $<HTMLInputElement>("#name").value.trim()); $("#nmsg").textContent = "Saved."; };
+  $("#savename").onclick = async () => {
+    const val = $<HTMLInputElement>("#name").value.trim();
+    if (val) {
+      await storePut("artist", val);
+      await addMyArtist(val);
+    }
+    $("#nmsg").textContent = "Saved.";
+  };
   if (key) {
     $("#kshow").onclick = () => { $("#kval").hidden = !$("#kval").hidden; };
     $("#kdl").onclick = () => {
