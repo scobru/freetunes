@@ -24,6 +24,9 @@ import commentsWasm from "./comments.wasm?url";
 import identityWasm from "./identity.wasm?url";
 import reportsWasm from "./reports.wasm?url";
 import anteWasm from "./ante-delegate.wasm?url";
+import { encodeFEC, decodeFEC, regenerateShard } from "freenet-blob";
+
+export { encodeFEC, decodeFEC, regenerateShard };
 
 const { bytesToHex: hex, hexToBytes: unhex } = ed.etc;
 const enc = new TextEncoder();
@@ -37,8 +40,12 @@ export const LICENSES: Record<string, string> = {
   cc0: "CC0 (public domain dedication)",
   "public-domain": "Public domain",
 };
-export interface ChunkRef { a: string; ms: number; n: number } // address, duration, size
-export interface TrackMeta { title: string; chunks: ChunkRef[] }
+export interface ChunkRef { a: string; ms: number; n: number; is_parity?: boolean } // address, duration, size
+export interface TrackMeta {
+  title: string;
+  chunks: ChunkRef[];
+  fec?: { k: number; m: number; total: number; shard_size: number; original_size: number };
+}
 export interface ReleaseMeta {
   title: string; artist: string; license: string; rights: boolean;
   cover?: { addr: string; n: number }; tracks: TrackMeta[]; ts: number;
@@ -725,49 +732,85 @@ export async function makeCover(file: File): Promise<Uint8Array> {
 // ---------------------------------------------------------------- streaming player
 const once = (t: EventTarget, ev: string) => new Promise<void>((r) => t.addEventListener(ev, () => r(), { once: true }));
 
+/** Fetch a chunk, with automatic Reed-Solomon auto-healing if the chunk is missing on Freenet. */
+export async function fetchChunkResilient(
+  index: number,
+  allChunks: ChunkRef[],
+  fecMeta?: { k: number; m: number; total: number; shard_size: number; original_size: number }
+): Promise<Uint8Array> {
+  try {
+    return await getChunk(allChunks[index].a);
+  } catch (err) {
+    if (!fecMeta || !fecMeta.k) throw err;
+    console.warn(`[FreeTunes FEC] Chunk #${index} missing on Freenet. Auto-healing via freenet-blob parity...`);
+    const availableShards: Array<{ index: number; data: Uint8Array }> = [];
+    for (let i = 0; i < allChunks.length; i++) {
+      if (i === index) continue;
+      try {
+        const data = await getChunk(allChunks[i].a);
+        availableShards.push({ index: i, data });
+        if (availableShards.length >= fecMeta.k) break;
+      } catch (_) {}
+    }
+    if (availableShards.length < fecMeta.k) {
+      throw new Error(`Insufficient parity to heal chunk #${index} (${availableShards.length}/${fecMeta.k} shards available)`);
+    }
+    return regenerateShard(availableShards, index, {
+      enabled: true,
+      k: fecMeta.k,
+      m: fecMeta.m,
+      total: fecMeta.total,
+      shardSize: fecMeta.shard_size,
+      originalSize: fecMeta.original_size,
+    });
+  }
+}
+
 /**
  * Plays a track from its chunks while they arrive: each chunk is appended to a MediaSource as soon as it is
  * fetched and playback starts after the first one. Falls back to downloading everything first when the browser
- * cannot stream MP3 this way.
+ * cannot stream MP3 this way. With freenet-blob, missing chunks are automatically healed on the fly.
  */
 export class Streamer {
   private gen = 0;
   constructor(private audio: HTMLAudioElement) {}
 
-  async play(chunks: ChunkRef[], onProgress: (done: number, total: number) => void) {
+  async play(chunks: ChunkRef[], onProgress: (done: number, total: number) => void, fecMeta?: any) {
+    const dataChunks = chunks.filter((c) => !c.is_parity);
     const gen = ++this.gen;
     const a = this.audio;
     a.pause();
     const canStream = "MediaSource" in window && MediaSource.isTypeSupported("audio/mpeg");
     if (canStream) {
-      try { await this.stream(gen, chunks, onProgress); return; }
+      try { await this.stream(gen, chunks, onProgress, fecMeta); return; }
       catch (e) { if (gen !== this.gen) return; console.warn("streaming failed, downloading instead:", e); }
     }
     const parts: Uint8Array[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      parts.push(await getChunk(chunks[i].a));
+    for (let i = 0; i < dataChunks.length; i++) {
+      parts.push(await fetchChunkResilient(i, chunks, fecMeta));
       if (gen !== this.gen) return;
-      onProgress(i + 1, chunks.length);
+      onProgress(i + 1, dataChunks.length);
     }
     a.src = URL.createObjectURL(new Blob(parts as BlobPart[], { type: "audio/mpeg" }));
     await a.play().catch(() => {});
   }
 
-  private async stream(gen: number, chunks: ChunkRef[], onProgress: (done: number, total: number) => void) {
+  private async stream(gen: number, chunks: ChunkRef[], onProgress: (done: number, total: number) => void, fecMeta?: any) {
+    const dataChunks = chunks.filter((c) => !c.is_parity);
     const a = this.audio, ms = new MediaSource();
     a.src = URL.createObjectURL(ms);
     await once(ms, "sourceopen");
     const sb = ms.addSourceBuffer("audio/mpeg");
-    let next = getChunk(chunks[0].a);
-    for (let i = 0; i < chunks.length; i++) {
+    let next = fetchChunkResilient(0, chunks, fecMeta);
+    for (let i = 0; i < dataChunks.length; i++) {
       const data = await next;
       if (gen !== this.gen) return; // another track was chosen
-      if (i + 1 < chunks.length) next = getChunk(chunks[i + 1].a); // fetch the next one while this one is appended
+      if (i + 1 < dataChunks.length) next = fetchChunkResilient(i + 1, chunks, fecMeta);
       const done = once(sb, "updateend");
       sb.appendBuffer(data as BufferSource);
       await done;
       if (i === 0) await a.play().catch(() => {}); // blocked autoplay: the user presses play
-      onProgress(i + 1, chunks.length);
+      onProgress(i + 1, dataChunks.length);
     }
     if (gen === this.gen && ms.readyState === "open") ms.endOfStream();
   }

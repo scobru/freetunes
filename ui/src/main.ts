@@ -6,7 +6,7 @@ import {
   watchRelease, loadReports, reportsFor, sendReport, ReportDeclined, WHOLE_RELEASE,
   FREETUNES_MAINTAINER, FREETUNES_DEFAULT_MODS, isMaintainer, isModerator,
   type ReportsState, type Kind, type ChunkRef, type CommentsState, type Identity, type Mp3Piece, type Release, type TrackMeta, type ReleaseMeta,
-  type DirEntry,
+  type DirEntry, encodeFEC,
 } from "./lib";
 
 const app = document.getElementById("app")!;
@@ -1329,10 +1329,36 @@ async function releaseForm(existing?: Release) {
       if (coverBytes) tick();
       const tracks: TrackMeta[] = [];
       for (const it of items) {
-        if (it.kind === "old") { tracks.push({ title: it.title.trim(), chunks: it.chunks }); continue; }
+        if (it.kind === "old") { tracks.push({ title: it.title.trim(), chunks: it.chunks, fec: (it as any).fec }); continue; }
+        const pieces = prepared.get(it)!;
         const chunks: ChunkRef[] = [];
-        for (const piece of prepared.get(it)!) { chunks.push({ a: await putChunk(piece.data), ms: piece.ms, n: piece.data.length }); tick(); }
-        tracks.push({ title: it.title.trim(), chunks });
+        for (const piece of pieces) { chunks.push({ a: await putChunk(piece.data), ms: piece.ms, n: piece.data.length, is_parity: false }); tick(); }
+
+        // Generate Reed-Solomon parity shards via freenet-blob for fault tolerance
+        let fecMeta: TrackMeta["fec"];
+        try {
+          const totalBytes = pieces.reduce((n, p) => n + p.data.length, 0);
+          const fullAudio = new Uint8Array(totalBytes);
+          let offset = 0;
+          for (const p of pieces) { fullAudio.set(p.data, offset); offset += p.data.length; }
+
+          const fecRes = encodeFEC(fullAudio, { shardSize: pieces[0].data.length });
+          for (let pIdx = 0; pIdx < fecRes.m; pIdx++) {
+            const parityData = fecRes.shards[fecRes.k + pIdx].data;
+            chunks.push({ a: await putChunk(parityData), ms: 0, n: parityData.length, is_parity: true });
+          }
+          fecMeta = {
+            k: fecRes.k,
+            m: fecRes.m,
+            total: fecRes.totalShards,
+            shard_size: fecRes.shardSize,
+            original_size: fecRes.originalSize,
+          };
+        } catch (e) {
+          console.warn("FEC parity generation failed, track will use standard linear chunks:", e);
+        }
+
+        tracks.push({ title: it.title.trim(), chunks, fec: fecMeta });
       }
       await flushKnown();
       const meId = await peekIdentity();
@@ -1581,7 +1607,7 @@ async function releasePage(instance: string, params: string, track = -1) {
     seeker.value = "0";
     status.textContent = "Buffering...";
     bigPlay.classList.add("playing");
-    void streamer.play(trackObj.chunks, (d, n) => (status.textContent = d < n ? `Buffering ${d}/${n}` : "")).catch((e) => {
+    void streamer.play(trackObj.chunks, (d, n) => (status.textContent = d < n ? `Buffering ${d}/${n}` : ""), trackObj.fec).catch((e) => {
       status.textContent = `Playback failed: ${e}`;
       bigPlay.classList.remove("playing");
     });
